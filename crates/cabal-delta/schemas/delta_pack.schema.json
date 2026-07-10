@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cabal-runtime.local/schemas/delta_pack.v1.json",
+  "title": "Cabal DeltaPack v1",
+  "type": "object",
+  "required": ["schema", "operation", "verdict", "files", "summary", "completeness", "raw_artifact"],
+  "properties": {
+    "schema": { "const": "cabal.delta_pack.v1" },
+    "operation": { "const": "git-diff" },
+    "verdict": { "enum": ["clean", "changed"] },
+    "files": { "type": "array" },
+    "summary": { "type": "object" },
+    "completeness": { "type": "string" },
+    "raw_artifact": { "type": "object", "required": ["uri", "sha256", "bytes"] }
+  }
+}

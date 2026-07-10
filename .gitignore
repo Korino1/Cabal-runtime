@@ -1,0 +1,52 @@
+# Cabal internal planning and orchestration records
+Concept.txt
+IMPLEMENTATION_PLAN.md
+MEMORYX_PROJECT_RECORD.md
+gpt.txt
+priority.txt
+contracts/
+.codex/
+
+# Local MemoryX project bases and fallback data stores
+.memoryx/
+memoryx_data/
+
+# Cabal local runtime artifacts
+.cabal/
+artifacts/
+
+# Internal development notes and scratch files
+*.local.md
+*.notes.md
+*.scratch.md
+*.tmp.md
+TODO.local*
+NOTES.local*
+
+# Rust build outputs
+target/
+Cargo.lock.tmp
+
+# Node/build outputs, if plugin tooling adds them later
+node_modules/
+dist/
+build/
+.turbo/
+.vite/
+
+# Logs and temporary command output
+*.log
+*.out
+*.err
+tmp/
+temp/
+.tmp/
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini

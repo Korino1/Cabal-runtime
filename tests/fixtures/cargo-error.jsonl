@@ -1,0 +1,2 @@
+{"reason":"compiler-message","message":{"level":"error","message":"use of moved value: `branches`","code":{"code":"E0382"},"spans":[{"file_name":"src/query.rs","line_start":184,"column_start":9,"is_primary":true},{"file_name":"src/query.rs","line_start":171,"column_start":5,"is_primary":false}]}}
+{"reason":"build-finished","success":false}

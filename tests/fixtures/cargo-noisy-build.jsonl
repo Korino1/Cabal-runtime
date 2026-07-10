@@ -1,0 +1,18 @@
+{"reason":"compiler-artifact","package_id":"dependency-a 1.0.0","target":{"name":"dependency-a","kind":["lib"]}}
+{"reason":"compiler-artifact","package_id":"dependency-b 1.0.0","target":{"name":"dependency-b","kind":["lib"]}}
+{"reason":"compiler-artifact","package_id":"dependency-c 1.0.0","target":{"name":"dependency-c","kind":["lib"]}}
+{"reason":"compiler-artifact","package_id":"dependency-d 1.0.0","target":{"name":"dependency-d","kind":["lib"]}}
+{"reason":"compiler-artifact","package_id":"dependency-e 1.0.0","target":{"name":"dependency-e","kind":["lib"]}}
+{"reason":"compiler-artifact","package_id":"dependency-f 1.0.0","target":{"name":"dependency-f","kind":["lib"]}}
+{"reason":"compiler-artifact","package_id":"dependency-g 1.0.0","target":{"name":"dependency-g","kind":["lib"]}}
+{"reason":"compiler-artifact","package_id":"dependency-h 1.0.0","target":{"name":"dependency-h","kind":["lib"]}}
+{"reason":"compiler-artifact","package_id":"dependency-i 1.0.0","target":{"name":"dependency-i","kind":["lib"]}}
+{"reason":"compiler-artifact","package_id":"dependency-j 1.0.0","target":{"name":"dependency-j","kind":["lib"]}}
+{"reason":"compiler-artifact","package_id":"dependency-k 1.0.0","target":{"name":"dependency-k","kind":["lib"]}}
+{"reason":"compiler-artifact","package_id":"dependency-l 1.0.0","target":{"name":"dependency-l","kind":["lib"]}}
+{"reason":"compiler-artifact","package_id":"dependency-m 1.0.0","target":{"name":"dependency-m","kind":["lib"]}}
+{"reason":"compiler-artifact","package_id":"dependency-n 1.0.0","target":{"name":"dependency-n","kind":["lib"]}}
+{"reason":"compiler-artifact","package_id":"dependency-o 1.0.0","target":{"name":"dependency-o","kind":["lib"]}}
+{"reason":"compiler-artifact","package_id":"dependency-p 1.0.0","target":{"name":"dependency-p","kind":["lib"]}}
+{"reason":"compiler-message","message":{"level":"error","message":"cannot borrow `state` as mutable","code":{"code":"E0596"},"spans":[{"file_name":"src/runtime.rs","line_start":73,"column_start":13,"is_primary":true}]}}
+{"reason":"build-finished","success":false}

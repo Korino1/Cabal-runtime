@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cabal-runtime.local/schemas/observation_pack.v1.json",
+  "title": "Cabal ObservationPack v1",
+  "type": "object",
+  "required": [
+    "schema",
+    "operation",
+    "verdict",
+    "diagnostics",
+    "omitted_sections",
+    "completeness",
+    "raw_artifact"
+  ],
+  "properties": {
+    "schema": { "const": "cabal.observation_pack.v1" },
+    "operation": { "enum": ["cargo-build", "cargo-test"] },
+    "verdict": { "enum": ["passed", "failed", "unknown"] },
+    "diagnostics": { "type": "array" },
+    "tests": { "type": "object" },
+    "omitted_sections": {
+      "type": "object",
+      "required": ["count", "reason"]
+    },
+    "completeness": { "type": "string" },
+    "raw_artifact": {
+      "type": "object",
+      "required": ["uri", "sha256", "bytes"]
+    }
+  }
+}

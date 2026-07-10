@@ -1,0 +1,48 @@
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 1111111..2222222 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -70,5 +70,6 @@ fn update_state() {
+ let old = 1;
+-let value = old;
++let value = old + 1;
++let audit = value;
+ send(value);
+ log_state(old);
+ log_state(value);
+ log_state(audit);
+ check_invariant(old);
+ check_invariant(value);
+ check_invariant(audit);
+ emit_metric("old", old);
+ emit_metric("value", value);
+ emit_metric("audit", audit);
+ persist_snapshot(old);
+ persist_snapshot(value);
+ persist_snapshot(audit);
+ record_receipt(old);
+ record_receipt(value);
+ record_receipt(audit);
+ update_cache(old);
+ update_cache(value);
+ update_cache(audit);
+ ensure_order(old);
+ ensure_order(value);
+ ensure_order(audit);
+ finish_cycle(old);
+ finish_cycle(value);
+ finish_cycle(audit);
+ }
+diff --git a/tests/runtime.rs b/tests/runtime.rs
+index 3333333..4444444 100644
+--- a/tests/runtime.rs
++++ b/tests/runtime.rs
+@@ -10,3 +10,4 @@ fn keeps_state() {
+ assert_eq!(state(), 1);
++assert!(audit());
+ assert!(state_is_consistent());
+ assert!(receipts_are_linked());
+ assert!(cache_is_current());
+ assert!(ordering_is_stable());
+ assert!(cycle_finished());
+ }
