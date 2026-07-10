@@ -1,0 +1,20 @@
+{
+  "name": "cabal-runtime-local",
+  "interface": {
+    "displayName": "Cabal Runtime Local"
+  },
+  "plugins": [
+    {
+      "name": "cabal-runtime",
+      "source": {
+        "source": "local",
+        "path": "./plugins/cabal-runtime"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
