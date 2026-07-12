@@ -46,6 +46,14 @@ Git runs directly without a shell, external diff drivers, or textconv. The model
 
 The gateway rejects flags, pathspecs, revision ranges, redirection, and composed shell commands. This module does not claim symbol, API, or behavioral interpretation.
 
+### File Read Delta Cache
+
+The gateway recognizes four exact bounded UTF-8 text reads: `cat <path>`, `Get-Content <path>`, `Get-Content -Raw <path>`, and `sed -n '<start>,<end>p' <path>`. A first read returns the exact requested content. A repeated covered read of unchanged content returns only a small `unchanged` receipt. When the file changes, the gateway returns the exact current requested content plus bounded changed-line ranges.
+
+Observations are scoped to the Codex session and invalidated by the standard `SessionStart` and `PostCompact` lifecycle hooks. Cabal hashes the bytes on every intercepted read, so same-size rewrites and restored timestamps cannot produce a false unchanged result. Cache hashes, snapshot paths, locks, and other bookkeeping never enter model-facing output.
+
+Full-file reads are limited to 256 KiB. Line reads are limited to 400 lines and 64 KiB, paths to 4096 bytes, and changed ranges to 64 entries. Binary data, invalid UTF-8, files outside the workspace, oversized requests, flags, wildcards, and composed shell expressions are left untouched for normal Codex execution.
+
 ### Supporting Normalizers
 
 - `cabal-observe` normalizes Cargo/rustc JSON and textual test output.
@@ -81,11 +89,21 @@ cargo +nightly clippy --workspace --all-targets -- -D warnings
 
 CI runs the test suite on Windows and Linux. Regression tests verify JUnit context reduction and prove that all Git gateway queries leave HEAD, index, and visible status unchanged while patch bodies remain outside model-facing output.
 
+File-cache regression tests cover repeated and newly requested ranges, BOM and Unicode, CRLF and missing final newlines, same-metadata rewrites, rapid changes, concurrent readers, session changes, compact invalidation, rename/delete behavior, path containment, invalid UTF-8, and size limits.
+
 ## License
 
 Dual-licensed under MIT or Apache-2.0.
 
 ## Описание на русском
+
+### Кэш дельт чтения файлов
+
+Gateway распознаёт четыре точные ограниченные формы чтения UTF-8 текста: `cat <path>`, `Get-Content <path>`, `Get-Content -Raw <path>` и `sed -n '<start>,<end>p' <path>`. Первое чтение возвращает точное запрошенное содержимое. Повторное чтение уже просмотренного и неизменённого диапазона возвращает только короткую квитанцию `unchanged`. После изменения файла модель получает точное текущее содержимое запрошенного диапазона и ограниченный список изменённых диапазонов строк.
+
+Наблюдения изолированы по сессии Codex и сбрасываются штатными hooks `SessionStart` и `PostCompact`. При каждом перехваченном чтении Cabal заново хеширует байты, поэтому замена файла с тем же размером и восстановленным временем изменения не создаёт ложный результат `unchanged`. Хеши, пути снимков, блокировки и служебное состояние не передаются модели.
+
+Полное чтение ограничено 256 КиБ. Диапазон ограничен 400 строками и 64 КиБ, путь — 4096 байтами, список изменений — 64 элементами. Бинарные данные, невалидный UTF-8, файлы вне рабочей области, превышение лимитов, флаги, wildcard и составные shell-выражения плагин не перехватывает: их штатно исполняет Codex.
 
 Cabal Runtime переносит детерминированную техническую обработку за пределы рабочего контекста модели. Вместо сырых логов компиляции и тестов, шума отчётов, хешей, путей артефактов и внутренних записей модель получает ограниченный семантический результат, необходимый для следующего решения.
 

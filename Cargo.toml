@@ -15,5 +15,5 @@ sha2 = "0.10"
 tempfile = "3"
 
 [workspace]
-members = ["crates/cabal-delta", "crates/cabal-log", "crates/cabal-runtime-hook"]
+members = ["crates/cabal-delta", "crates/cabal-file-cache", "crates/cabal-log", "crates/cabal-runtime-hook"]
 resolver = "3"

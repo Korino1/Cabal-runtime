@@ -13,6 +13,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cabal_delta::{
     DeltaPack, GitStatusPack, StatusKind, normalize_bytes as normalize_diff, normalize_status_bytes,
 };
+use cabal_file_cache::{
+    FileObservation, RequestedRange, invalidate_observations, observe_file, supports_request,
+};
 use cabal_log::{
     InputKind as LogInputKind, LogPack, Verdict as LogVerdict, normalize_bytes as normalize_log,
 };
@@ -37,6 +40,8 @@ pub struct PreToolUseInput {
     pub cwd: PathBuf,
     pub tool_name: String,
     pub tool_input: Value,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,6 +107,14 @@ enum GitQuery {
     Show { revision: String },
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct FileReadExecutionRequest {
+    cwd: PathBuf,
+    path: PathBuf,
+    session_id: String,
+    requested: RequestedRange,
+}
+
 #[derive(Debug, Serialize)]
 pub struct HookOutput {
     #[serde(rename = "continue")]
@@ -127,6 +140,7 @@ enum ModelProjection {
     Diff(DiffProjection),
     Log(LogProjection),
     Git(GitProjection),
+    FileRead(FileObservation),
     Command(CommandProjection),
 }
 
@@ -367,6 +381,11 @@ pub fn prepare_pre_tool_use(
     } else if let Some(request) = parse_simple_log_command(command, &input.cwd) {
         let request_path = persist_execution_request(&input.cwd, &request)?;
         build_executor_command(executable, "execute-log", &request_path)
+    } else if let Some(request) =
+        parse_simple_file_read(command, &input.cwd, input.session_id.as_deref())
+    {
+        let request_path = persist_file_read_request(&input.cwd, &request)?;
+        build_executor_command(executable, "execute-file-read", &request_path)
     } else if let Some(request) = parse_simple_git_command(command, &input.cwd) {
         let request_path = persist_git_execution_request(&input.cwd, &request)?;
         build_executor_command(executable, "execute-git", &request_path)
@@ -383,6 +402,30 @@ pub fn prepare_pre_tool_use(
             },
         },
     }))
+}
+
+/// Executes one bounded UTF-8 file observation without a shell.
+pub fn execute_file_read_request(request_path: &Path) -> Result<String, HookError> {
+    let raw_request = fs::read(request_path)?;
+    let _ = fs::remove_file(request_path);
+    let request = serde_json::from_slice::<FileReadExecutionRequest>(&raw_request)?;
+    let workspace = fs::canonicalize(&request.cwd)?;
+    let state_root = file_cache_root(&workspace);
+    let observation = observe_file(
+        &request.path,
+        &workspace,
+        &state_root,
+        &request.session_id,
+        request.requested,
+    )
+    .map_err(|_| HookError::InvalidInput("file observation failed"))?;
+    serde_json::to_string(&ModelProjection::FileRead(observation)).map_err(Into::into)
+}
+
+pub fn invalidate_file_read_cache(cwd: &Path) -> Result<(), HookError> {
+    let workspace = fs::canonicalize(cwd)?;
+    invalidate_observations(&file_cache_root(&workspace))
+        .map_err(|_| HookError::InvalidInput("file cache invalidation failed"))
 }
 
 /// Executes a contract-approved, read-only Git query without a shell.
@@ -670,6 +713,101 @@ fn parse_simple_log_command(command: &str, cwd: &Path) -> Option<LogExecutionReq
     })
 }
 
+fn parse_simple_file_read(
+    command: &str,
+    cwd: &Path,
+    session_id: Option<&str>,
+) -> Option<FileReadExecutionRequest> {
+    let words = split_simple_read_words(command)?;
+    let (path, requested) = match words.as_slice() {
+        [reader, path] if reader == "cat" || reader == "Get-Content" => {
+            (path, RequestedRange::Full)
+        }
+        [reader, raw, path] if reader == "Get-Content" && raw == "-Raw" => {
+            (path, RequestedRange::Full)
+        }
+        [reader, option, range, path] if reader == "sed" && option == "-n" => {
+            (path, parse_sed_range(range)?)
+        }
+        _ => return None,
+    };
+    if infer_log_kind(path).is_some() {
+        return None;
+    }
+    let path = PathBuf::from(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    if !supports_request(&path, cwd, requested) {
+        return None;
+    }
+    Some(FileReadExecutionRequest {
+        cwd: cwd.to_path_buf(),
+        path,
+        session_id: session_id.unwrap_or("session-unavailable").to_owned(),
+        requested,
+    })
+}
+
+fn split_simple_read_words(command: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    for character in command.chars() {
+        match quote {
+            Some(delimiter) if character == delimiter => quote = None,
+            Some('"') if matches!(character, '$' | '`') => return None,
+            Some(_) => current.push(character),
+            None if matches!(character, '\'' | '"') => quote = Some(character),
+            None if character.is_whitespace() => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            None if matches!(
+                character,
+                ';' | '|'
+                    | '&'
+                    | '>'
+                    | '<'
+                    | '`'
+                    | '$'
+                    | '*'
+                    | '?'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '('
+                    | ')'
+            ) =>
+            {
+                return None;
+            }
+            None => current.push(character),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    (!words.is_empty()).then_some(words)
+}
+
+fn parse_sed_range(value: &str) -> Option<RequestedRange> {
+    let value = value.strip_suffix('p')?;
+    let (start, end) = value.split_once(',')?;
+    let start = start.parse().ok()?;
+    let end = end.parse().ok()?;
+    let requested = RequestedRange::Lines { start, end };
+    (start > 0 && end >= start && end - start < cabal_file_cache::MAX_SLICE_LINES)
+        .then_some(requested)
+}
+
 fn parse_simple_git_command(command: &str, cwd: &Path) -> Option<GitExecutionRequest> {
     let words = command.split_whitespace().collect::<Vec<_>>();
     let query = match words.as_slice() {
@@ -742,6 +880,10 @@ fn persist_git_execution_request(
     persist_request_at(&git_runtime_root(cwd).join("requests"), request)
 }
 
+fn persist_file_read_request(cwd: &Path, request: &impl Serialize) -> Result<PathBuf, HookError> {
+    persist_request_at(&file_cache_root(cwd).join("requests"), request)
+}
+
 fn persist_request_at(root: &Path, request: &impl Serialize) -> Result<PathBuf, HookError> {
     fs::create_dir_all(root)?;
     let timestamp = SystemTime::now()
@@ -777,6 +919,10 @@ fn git_runtime_root(cwd: &Path) -> PathBuf {
         }
     }
     cwd.join(".cabal").join("git-runtime")
+}
+
+fn file_cache_root(cwd: &Path) -> PathBuf {
+    git_runtime_root(cwd).join("file-cache")
 }
 
 fn build_executor_command(executable: &Path, subcommand: &str, request_path: &Path) -> String {
@@ -1413,6 +1559,7 @@ mod tests {
             cwd: workspace.path().to_path_buf(),
             tool_name: "Bash".to_owned(),
             tool_input: serde_json::json!({ "command": original }),
+            session_id: None,
         };
 
         let output = prepare_pre_tool_use(input, Path::new("/opt/cabal-runtime-hook"))
@@ -1468,6 +1615,7 @@ mod tests {
                 cwd: workspace.path().to_path_buf(),
                 tool_name: "Bash".to_owned(),
                 tool_input: serde_json::json!({ "command": command }),
+                session_id: None,
             };
             assert!(
                 prepare_pre_tool_use(input, Path::new("/opt/cabal-runtime-hook"))
@@ -1535,6 +1683,7 @@ mod tests {
             tool_input: serde_json::json!({
                 "command": "Get-Content results.junit.xml"
             }),
+            session_id: None,
         };
 
         let output = prepare_pre_tool_use(input, Path::new("/opt/cabal-runtime-hook"))
@@ -1575,6 +1724,7 @@ mod tests {
                 cwd: workspace.path().to_path_buf(),
                 tool_name: "Bash".to_owned(),
                 tool_input: serde_json::json!({ "command": command }),
+                session_id: None,
             };
             assert!(
                 prepare_pre_tool_use(input, Path::new("/opt/cabal-runtime-hook"))
@@ -1783,6 +1933,121 @@ mod tests {
             assert!(!projection.contains("sha256"));
             assert!(!projection.contains(".cabal"));
         }
+    }
+
+    #[test]
+    fn file_read_grammar_is_exact_bounded_and_does_not_steal_logs() {
+        let workspace = tempfile::tempdir().unwrap();
+        let text = workspace.path().join("unicode file.txt");
+        fs::write(&text, "one\ntwo\nthree\n").unwrap();
+        let log = workspace.path().join("build.log");
+        fs::write(&log, "error\n").unwrap();
+        let binary = workspace.path().join("binary.bin");
+        fs::write(&binary, [0xff, 0xfe]).unwrap();
+
+        for (command, requested) in [
+            ("cat 'unicode file.txt'", RequestedRange::Full),
+            ("Get-Content \"unicode file.txt\"", RequestedRange::Full),
+            ("Get-Content -Raw 'unicode file.txt'", RequestedRange::Full),
+            (
+                "sed -n '2,3p' 'unicode file.txt'",
+                RequestedRange::Lines { start: 2, end: 3 },
+            ),
+        ] {
+            let request =
+                parse_simple_file_read(command, workspace.path(), Some("session")).unwrap();
+            assert_eq!(request.requested, requested);
+            assert_eq!(request.path, text);
+        }
+
+        for command in [
+            "cat build.log",
+            "cat binary.bin",
+            "cat unicode file.txt",
+            "cat *.txt",
+            "cat file.txt | head",
+            "Get-Content file.txt; echo leaked",
+            "sed -n '0,2p' file.txt",
+            "sed -n '1,401p' file.txt",
+            "sed -n '1p' file.txt",
+        ] {
+            assert!(parse_simple_file_read(command, workspace.path(), Some("session")).is_none());
+        }
+    }
+
+    #[test]
+    fn file_read_gateway_refreshes_by_session_change_and_invalidation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("large file.txt");
+        let first_content = format!("header\n{}\nfooter\n", "x".repeat(10_000));
+        fs::write(&path, &first_content).unwrap();
+
+        let first = execute_file_read(workspace.path(), &path, "session-a", RequestedRange::Full);
+        let unchanged =
+            execute_file_read(workspace.path(), &path, "session-a", RequestedRange::Full);
+        assert!(first.contains("\"status\":\"content\""));
+        assert!(first.contains("header\\n"));
+        assert!(unchanged.contains("\"status\":\"unchanged\""));
+        assert!(!unchanged.contains(&"x".repeat(100)));
+        assert!(unchanged.len() * 10 < first.len());
+
+        let changed_content = format!("header\n{}\nfooter changed\n", "y".repeat(10_000));
+        fs::write(&path, &changed_content).unwrap();
+        let changed = execute_file_read(workspace.path(), &path, "session-a", RequestedRange::Full);
+        assert!(changed.contains("\"status\":\"changed\""));
+        assert!(changed.contains("footer changed"));
+        assert!(changed.contains("changed_ranges"));
+
+        let new_session =
+            execute_file_read(workspace.path(), &path, "session-b", RequestedRange::Full);
+        assert!(new_session.contains("\"status\":\"content\""));
+
+        invalidate_file_read_cache(workspace.path()).unwrap();
+        let after_compact =
+            execute_file_read(workspace.path(), &path, "session-a", RequestedRange::Full);
+        assert!(after_compact.contains("\"status\":\"content\""));
+        for projection in [&first, &unchanged, &changed, &new_session, &after_compact] {
+            assert!(!projection.contains("sha256"));
+            assert!(!projection.contains("snapshots"));
+            assert!(!projection.contains(".cabal"));
+        }
+    }
+
+    #[test]
+    fn pre_tool_use_rewrites_supported_file_read_to_native_executor() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("notes.txt"), "visible\n").unwrap();
+        let input = PreToolUseInput {
+            hook_event_name: "PreToolUse".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            tool_name: "Bash".to_owned(),
+            tool_input: serde_json::json!({ "command": "cat notes.txt" }),
+            session_id: Some("session-42".to_owned()),
+        };
+
+        let output = prepare_pre_tool_use(input, Path::new("/opt/cabal-runtime-hook"))
+            .unwrap()
+            .unwrap();
+        let serialized = serde_json::to_string(&output).unwrap();
+
+        assert!(serialized.contains("execute-file-read"));
+        assert!(!serialized.contains("cat notes.txt"));
+    }
+
+    fn execute_file_read(
+        cwd: &Path,
+        path: &Path,
+        session_id: &str,
+        requested: RequestedRange,
+    ) -> String {
+        let request = FileReadExecutionRequest {
+            cwd: cwd.to_path_buf(),
+            path: path.to_path_buf(),
+            session_id: session_id.to_owned(),
+            requested,
+        };
+        let request_path = persist_file_read_request(cwd, &request).unwrap();
+        execute_file_read_request(&request_path).unwrap()
     }
 
     fn execute_git(cwd: &Path, query: GitQuery) -> String {

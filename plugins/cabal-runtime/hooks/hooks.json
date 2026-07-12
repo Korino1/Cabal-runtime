@@ -12,6 +12,32 @@
           }
         ]
       }
+    ],
+    "PostCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cabal-runtime-hook invalidate-file-cache",
+            "timeout": 10,
+            "statusMessage": "Refreshing file observations"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cabal-runtime-hook invalidate-file-cache",
+            "timeout": 10,
+            "statusMessage": "Starting file observations"
+          }
+        ]
+      }
     ]
   }
 }

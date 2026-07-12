@@ -1,7 +1,7 @@
 {
   "name": "cabal-runtime",
-  "version": "0.4.0+codex.local-20260712-201604",
-  "description": "Native pre-execution projection for supported Cargo commands, structured logs, and Git deltas.",
+  "version": "0.5.0+codex.local-20260712-233823",
+  "description": "Native context projection for supported Cargo commands, structured logs, Git deltas, and repeated file reads.",
   "author": {
     "name": "Korino1",
     "email": "necroticus1@gmail.com",
