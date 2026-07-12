@@ -337,7 +337,10 @@ fn parse_cargo_test_text(text: &str) -> ParsedObservation {
         }
 
         if let Some(parsed) = parse_test_summary(line) {
-            summary = Some(parsed);
+            summary = Some(match summary {
+                Some(current) => merge_test_summaries(current, parsed),
+                None => parsed,
+            });
             continue;
         }
 
@@ -451,6 +454,22 @@ fn parse_test_summary(line: &str) -> Option<TestSummary> {
     })
 }
 
+fn merge_test_summaries(left: TestSummary, right: TestSummary) -> TestSummary {
+    TestSummary {
+        passed: merge_test_count(left.passed, right.passed),
+        failed: merge_test_count(left.failed, right.failed),
+        ignored: merge_test_count(left.ignored, right.ignored),
+    }
+}
+
+fn merge_test_count(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
 fn summary_count(line: &str, name: &str) -> Option<u64> {
     let marker = format!(" {name};");
     let before = line.split_once(&marker)?.0;
@@ -542,5 +561,16 @@ mod tests {
         assert_eq!(pack.diagnostics.len(), 1);
         assert_eq!(pack.diagnostics[0].kind, "test_failure");
         assert_eq!(pack.diagnostics[0].message, "parser::returns_error");
+    }
+
+    #[test]
+    fn aggregates_multiple_cargo_test_suite_summaries() {
+        let raw = b"test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        let artifacts = tempfile::tempdir().unwrap();
+
+        let pack = normalize_bytes(InputKind::CargoTestText, raw, artifacts.path()).unwrap();
+
+        assert_eq!(pack.verdict, Verdict::Passed);
+        assert_eq!(pack.tests.unwrap().passed, Some(2));
     }
 }

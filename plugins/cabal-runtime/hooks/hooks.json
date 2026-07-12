@@ -1,14 +1,14 @@
 {
   "hooks": {
-    "PostToolUse": [
+    "PreToolUse": [
       {
         "matcher": "^Bash$",
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"$env:PLUGIN_ROOT\\scripts\\post_tool_use.ps1\"",
+            "command": "cabal-runtime-hook pre-tool-use",
             "timeout": 30,
-            "statusMessage": "Processing command result"
+            "statusMessage": "Running validation"
           }
         ]
       }

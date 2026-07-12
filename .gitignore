@@ -16,6 +16,8 @@ memoryx_data/
 artifacts/
 
 # Internal development notes and scratch files
+.codegraph/
+1.txt
 *.local.md
 *.notes.md
 *.scratch.md
