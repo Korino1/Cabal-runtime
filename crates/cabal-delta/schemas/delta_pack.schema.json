@@ -1,16 +1,27 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://cabal-runtime.local/schemas/delta_pack.v1.json",
-  "title": "Cabal DeltaPack v1",
+  "$id": "https://cabal-runtime.local/schemas/delta_pack.v2.json",
+  "title": "Cabal DeltaPack v2",
   "type": "object",
-  "required": ["schema", "operation", "verdict", "files", "summary", "completeness", "raw_artifact"],
+  "required": ["schema", "operation", "verdict", "files", "summary", "completeness", "omitted_files", "omitted_hunks"],
   "properties": {
-    "schema": { "const": "cabal.delta_pack.v1" },
+    "schema": { "const": "cabal.delta_pack.v2" },
     "operation": { "const": "git-diff" },
     "verdict": { "enum": ["clean", "changed"] },
-    "files": { "type": "array" },
+    "files": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "required": ["change_kind", "classification", "is_binary", "additions", "deletions"],
+        "properties": {
+          "hunks": { "type": "array", "maxItems": 64 }
+        }
+      }
+    },
     "summary": { "type": "object" },
     "completeness": { "type": "string" },
-    "raw_artifact": { "type": "object", "required": ["uri", "sha256", "bytes"] }
+    "omitted_files": { "type": "integer", "minimum": 0 },
+    "omitted_hunks": { "type": "integer", "minimum": 0 }
   }
 }

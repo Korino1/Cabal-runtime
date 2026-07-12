@@ -3,12 +3,17 @@
 //! This crate never invokes Git. It stores raw diff bytes as an artifact and
 //! returns a compact structural projection suitable for later internal routing.
 
+#![forbid(unsafe_code)]
+
 use std::{fs, io, path::Path};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: &str = "cabal.delta_pack.v1";
+const SCHEMA_VERSION: &str = "cabal.delta_pack.v2";
+pub const MAX_FILES: usize = 128;
+pub const MAX_HUNKS_PER_FILE: usize = 64;
+pub const MAX_HUNKS_TOTAL: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -26,6 +31,31 @@ pub enum ChangeKind {
     Renamed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileClassification {
+    Manifest,
+    Source,
+    Test,
+    Generated,
+    Lockfile,
+    Documentation,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusKind {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    TypeChanged,
+    Unmerged,
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hunk {
     pub old_start: u64,
@@ -41,6 +71,7 @@ pub struct FileDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_path: Option<String>,
     pub change_kind: ChangeKind,
+    pub classification: FileClassification,
     pub is_binary: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hunks: Vec<Hunk>,
@@ -75,6 +106,41 @@ pub struct DeltaPack {
     pub files: Vec<FileDelta>,
     pub summary: DeltaSummary,
     pub completeness: String,
+    pub omitted_files: u64,
+    pub omitted_hunks: u64,
+    #[serde(skip_serializing)]
+    pub raw_artifact: RawArtifact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusEntry {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_status: Option<StatusKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_status: Option<StatusKind>,
+    pub untracked: bool,
+    pub classification: FileClassification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusSummary {
+    pub files_changed: u64,
+    pub staged: u64,
+    pub unstaged: u64,
+    pub untracked: u64,
+    pub conflicts: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitStatusPack {
+    pub entries: Vec<StatusEntry>,
+    pub summary: StatusSummary,
+    pub completeness: String,
+    pub omitted_files: u64,
+    #[serde(skip_serializing)]
     pub raw_artifact: RawArtifact,
 }
 
@@ -85,6 +151,7 @@ pub enum DeltaError {
     UnsupportedQuotedPath(String),
     MalformedDiffHeader(String),
     MalformedHunk(String),
+    MalformedStatus(String),
 }
 
 impl std::fmt::Display for DeltaError {
@@ -97,6 +164,7 @@ impl std::fmt::Display for DeltaError {
             }
             Self::MalformedDiffHeader(line) => write!(formatter, "malformed diff header: {line}"),
             Self::MalformedHunk(line) => write!(formatter, "malformed diff hunk: {line}"),
+            Self::MalformedStatus(line) => write!(formatter, "malformed Git status: {line}"),
         }
     }
 }
@@ -141,11 +209,7 @@ impl FileBuilder {
         let old_path = old_path
             .strip_prefix("a/")
             .ok_or_else(|| DeltaError::MalformedDiffHeader(line.to_owned()))?;
-        if old_path.is_empty()
-            || new_path.is_empty()
-            || new_path.contains(' ')
-            || old_path.contains(' ')
-        {
+        if old_path.is_empty() || new_path.is_empty() {
             return Err(DeltaError::UnsupportedQuotedPath(line.to_owned()));
         }
 
@@ -161,10 +225,17 @@ impl FileBuilder {
     }
 
     fn finish(self) -> FileDelta {
+        let classification = classify_path(
+            self.new_path
+                .as_deref()
+                .or(self.old_path.as_deref())
+                .unwrap_or_default(),
+        );
         FileDelta {
             old_path: self.old_path,
             new_path: self.new_path,
             change_kind: self.change_kind,
+            classification,
             is_binary: self.is_binary,
             hunks: self.hunks,
             additions: self.additions,
@@ -180,8 +251,28 @@ pub fn normalize_file(input: &Path, artifact_root: &Path) -> Result<DeltaPack, D
 pub fn normalize_bytes(raw: &[u8], artifact_root: &Path) -> Result<DeltaPack, DeltaError> {
     let raw_artifact = persist_raw_artifact(raw, artifact_root)?;
     let diff = String::from_utf8(raw.to_vec())?;
-    let files = parse_unified_diff(&diff)?;
+    let mut files = parse_unified_diff(&diff)?;
+    if !diff.trim().is_empty() && files.is_empty() {
+        return Err(DeltaError::MalformedDiffHeader(
+            "non-empty output contained no diff header".to_owned(),
+        ));
+    }
     let summary = summarize(&files);
+    let mut omitted_hunks = 0;
+    let mut remaining_hunks = MAX_HUNKS_TOTAL;
+    for file in &mut files {
+        let retained = file
+            .hunks
+            .len()
+            .min(MAX_HUNKS_PER_FILE)
+            .min(remaining_hunks);
+        omitted_hunks += file.hunks.len().saturating_sub(retained) as u64;
+        file.hunks.truncate(retained);
+        remaining_hunks -= retained;
+    }
+    let omitted_files = files.len().saturating_sub(MAX_FILES) as u64;
+    files.truncate(MAX_FILES);
+    let complete = omitted_files == 0 && omitted_hunks == 0;
 
     Ok(DeltaPack {
         schema: SCHEMA_VERSION.to_owned(),
@@ -193,9 +284,199 @@ pub fn normalize_bytes(raw: &[u8], artifact_root: &Path) -> Result<DeltaPack, De
         },
         files,
         summary,
-        completeness: "all supported unified-diff file boundaries, hunk ranges, statuses, and patch-line counts retained".to_owned(),
+        completeness: if complete {
+            "all supported unified-diff file boundaries, hunk ranges, statuses, and patch-line counts retained"
+        } else {
+            "bounded projection; omitted file or hunk counts are reported"
+        }
+        .to_owned(),
+        omitted_files,
+        omitted_hunks,
         raw_artifact,
     })
+}
+
+pub fn normalize_status_bytes(
+    raw: &[u8],
+    artifact_root: &Path,
+) -> Result<GitStatusPack, DeltaError> {
+    let raw_artifact = persist_raw_artifact(raw, artifact_root)?;
+    let text = String::from_utf8(raw.to_vec())?;
+    let records = text.split('\0').collect::<Vec<_>>();
+    let mut entries = Vec::new();
+    let mut index = 0;
+    while index < records.len() {
+        let record = records[index];
+        index += 1;
+        if record.is_empty() {
+            continue;
+        }
+        let entry = if let Some(path) = record.strip_prefix("? ") {
+            StatusEntry {
+                path: path.to_owned(),
+                original_path: None,
+                index_status: None,
+                worktree_status: None,
+                untracked: true,
+                classification: classify_path(path),
+            }
+        } else if record.starts_with("1 ") {
+            let fields = record.splitn(9, ' ').collect::<Vec<_>>();
+            if fields.len() != 9 {
+                return Err(DeltaError::MalformedStatus(record.to_owned()));
+            }
+            status_entry(fields[1], fields[8], None)?
+        } else if record.starts_with("2 ") {
+            let fields = record.splitn(10, ' ').collect::<Vec<_>>();
+            if fields.len() != 10 {
+                return Err(DeltaError::MalformedStatus(record.to_owned()));
+            }
+            let original_path = records
+                .get(index)
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| DeltaError::MalformedStatus(record.to_owned()))?;
+            index += 1;
+            status_entry(fields[1], fields[9], Some((*original_path).to_owned()))?
+        } else if record.starts_with("u ") {
+            let fields = record.splitn(11, ' ').collect::<Vec<_>>();
+            if fields.len() != 11 {
+                return Err(DeltaError::MalformedStatus(record.to_owned()));
+            }
+            let mut entry = status_entry(fields[1], fields[10], None)?;
+            entry.index_status = Some(StatusKind::Unmerged);
+            entry.worktree_status = Some(StatusKind::Unmerged);
+            entry
+        } else if record.starts_with("! ") {
+            continue;
+        } else {
+            return Err(DeltaError::MalformedStatus(record.to_owned()));
+        };
+        entries.push(entry);
+    }
+
+    let summary = summarize_status(&entries);
+    let omitted_files = entries.len().saturating_sub(MAX_FILES) as u64;
+    entries.truncate(MAX_FILES);
+    Ok(GitStatusPack {
+        entries,
+        summary,
+        completeness: if omitted_files == 0 {
+            "all porcelain-v2 status entries retained"
+        } else {
+            "bounded projection; omitted status entry count is reported"
+        }
+        .to_owned(),
+        omitted_files,
+        raw_artifact,
+    })
+}
+
+fn status_entry(
+    xy: &str,
+    path: &str,
+    original_path: Option<String>,
+) -> Result<StatusEntry, DeltaError> {
+    let mut chars = xy.chars();
+    let index_status = status_kind(chars.next().unwrap_or('.'));
+    let worktree_status = status_kind(chars.next().unwrap_or('.'));
+    if chars.next().is_some() {
+        return Err(DeltaError::MalformedStatus(xy.to_owned()));
+    }
+    Ok(StatusEntry {
+        path: path.to_owned(),
+        original_path,
+        index_status,
+        worktree_status,
+        untracked: false,
+        classification: classify_path(path),
+    })
+}
+
+fn status_kind(code: char) -> Option<StatusKind> {
+    match code {
+        '.' => None,
+        'A' => Some(StatusKind::Added),
+        'M' => Some(StatusKind::Modified),
+        'D' => Some(StatusKind::Deleted),
+        'R' => Some(StatusKind::Renamed),
+        'C' => Some(StatusKind::Copied),
+        'T' => Some(StatusKind::TypeChanged),
+        'U' => Some(StatusKind::Unmerged),
+        _ => Some(StatusKind::Unknown),
+    }
+}
+
+fn summarize_status(entries: &[StatusEntry]) -> StatusSummary {
+    StatusSummary {
+        files_changed: entries.len() as u64,
+        staged: entries
+            .iter()
+            .filter(|entry| entry.index_status.is_some())
+            .count() as u64,
+        unstaged: entries
+            .iter()
+            .filter(|entry| entry.worktree_status.is_some())
+            .count() as u64,
+        untracked: entries.iter().filter(|entry| entry.untracked).count() as u64,
+        conflicts: entries
+            .iter()
+            .filter(|entry| {
+                entry.index_status == Some(StatusKind::Unmerged)
+                    || entry.worktree_status == Some(StatusKind::Unmerged)
+            })
+            .count() as u64,
+    }
+}
+
+pub fn classify_path(path: &str) -> FileClassification {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    if matches!(
+        name,
+        "cargo.toml" | "package.json" | "pyproject.toml" | "go.mod" | "build.gradle" | "pom.xml"
+    ) {
+        FileClassification::Manifest
+    } else if name.ends_with(".lock") || matches!(name, "cargo.lock" | "package-lock.json") {
+        FileClassification::Lockfile
+    } else if normalized.contains("/generated/")
+        || normalized.starts_with("generated/")
+        || normalized.contains("/target/")
+        || normalized.contains("/dist/")
+    {
+        FileClassification::Generated
+    } else if normalized.contains("/tests/")
+        || normalized.starts_with("tests/")
+        || name.ends_with("_test.rs")
+        || name.ends_with(".test.ts")
+        || name.ends_with(".spec.ts")
+    {
+        FileClassification::Test
+    } else if matches!(
+        name.rsplit_once('.').map(|(_, extension)| extension),
+        Some(
+            "rs" | "c"
+                | "cc"
+                | "cpp"
+                | "h"
+                | "hpp"
+                | "go"
+                | "py"
+                | "js"
+                | "ts"
+                | "tsx"
+                | "java"
+                | "kt"
+        )
+    ) {
+        FileClassification::Source
+    } else if matches!(
+        name.rsplit_once('.').map(|(_, extension)| extension),
+        Some("md" | "rst" | "txt" | "adoc")
+    ) {
+        FileClassification::Documentation
+    } else {
+        FileClassification::Other
+    }
 }
 
 fn persist_raw_artifact(raw: &[u8], artifact_root: &Path) -> Result<RawArtifact, io::Error> {
@@ -267,6 +548,7 @@ fn parse_unified_diff(diff: &str) -> Result<Vec<FileDelta>, DeltaError> {
 }
 
 fn marker_path(value: &str) -> Option<String> {
+    let value = value.trim_end_matches('\t');
     if value == "/dev/null" {
         return None;
     }
@@ -414,5 +696,98 @@ mod tests {
             normalize_bytes(raw, artifacts.path()),
             Err(DeltaError::UnsupportedQuotedPath(_))
         ));
+    }
+
+    #[test]
+    fn preserves_spaces_and_unicode_when_git_disables_path_quoting() {
+        let artifacts = tempfile::tempdir().unwrap();
+        let raw = "diff --git a/old name.rs b/юникод name.rs\nrename from old name.rs\nrename to юникод name.rs\n";
+
+        let pack = normalize_bytes(raw.as_bytes(), artifacts.path()).unwrap();
+
+        assert_eq!(pack.files[0].old_path.as_deref(), Some("old name.rs"));
+        assert_eq!(pack.files[0].new_path.as_deref(), Some("юникод name.rs"));
+        assert_eq!(pack.files[0].change_kind, ChangeKind::Renamed);
+        assert_eq!(pack.files[0].classification, FileClassification::Source);
+    }
+
+    #[test]
+    fn parses_porcelain_v2_staged_unstaged_untracked_and_rename() {
+        let artifacts = tempfile::tempdir().unwrap();
+        let raw = concat!(
+            "1 M. N... 100644 100644 100644 aaaaaaa bbbbbbb Cargo.toml\0",
+            "1 .M N... 100644 100644 100644 aaaaaaa bbbbbbb src/lib.rs\0",
+            "2 R. N... 100644 100644 100644 aaaaaaa bbbbbbb R100 юникод name.rs\0old name.rs\0",
+            "? tests/new test.rs\0"
+        );
+
+        let pack = normalize_status_bytes(raw.as_bytes(), artifacts.path()).unwrap();
+
+        assert_eq!(pack.summary.files_changed, 4);
+        assert_eq!(pack.summary.staged, 2);
+        assert_eq!(pack.summary.unstaged, 1);
+        assert_eq!(pack.summary.untracked, 1);
+        assert_eq!(pack.entries[0].classification, FileClassification::Manifest);
+        assert_eq!(pack.entries[1].classification, FileClassification::Source);
+        assert_eq!(
+            pack.entries[2].original_path.as_deref(),
+            Some("old name.rs")
+        );
+        assert_eq!(pack.entries[3].classification, FileClassification::Test);
+    }
+
+    #[test]
+    fn malformed_nonempty_outputs_never_become_clean() {
+        let artifacts = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            normalize_bytes(b"fatal: not a repository", artifacts.path()),
+            Err(DeltaError::MalformedDiffHeader(_))
+        ));
+        assert!(matches!(
+            normalize_status_bytes(b"unexpected\0", artifacts.path()),
+            Err(DeltaError::MalformedStatus(_))
+        ));
+    }
+
+    #[test]
+    fn projections_are_bounded_with_explicit_omissions() {
+        let artifacts = tempfile::tempdir().unwrap();
+        let raw = (0..(MAX_FILES + 3))
+            .map(|index| format!("? generated/file-{index}.rs\0"))
+            .collect::<String>();
+
+        let pack = normalize_status_bytes(raw.as_bytes(), artifacts.path()).unwrap();
+
+        assert_eq!(pack.entries.len(), MAX_FILES);
+        assert_eq!(pack.summary.files_changed, (MAX_FILES + 3) as u64);
+        assert_eq!(pack.omitted_files, 3);
+        assert!(pack.completeness.contains("bounded"));
+    }
+
+    #[test]
+    fn diff_hunks_obey_per_file_and_global_limits() {
+        let artifacts = tempfile::tempdir().unwrap();
+        let mut raw = String::new();
+        for file in 0..5 {
+            raw.push_str(&format!("diff --git a/file-{file}.rs b/file-{file}.rs\n"));
+            for hunk in 0..70 {
+                raw.push_str(&format!(
+                    "@@ -{},1 +{},1 @@\n-old\n+new\n",
+                    hunk + 1,
+                    hunk + 1
+                ));
+            }
+        }
+
+        let pack = normalize_bytes(raw.as_bytes(), artifacts.path()).unwrap();
+        let retained = pack
+            .files
+            .iter()
+            .map(|file| file.hunks.len())
+            .sum::<usize>();
+
+        assert_eq!(retained, MAX_HUNKS_TOTAL);
+        assert_eq!(pack.omitted_hunks, 350 - MAX_HUNKS_TOTAL as u64);
+        assert!(pack.completeness.contains("bounded"));
     }
 }

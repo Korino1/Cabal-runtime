@@ -1,9 +1,9 @@
 [package]
 name = "cabal-runtime-hook"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Native Codex PreToolUse context gateway for Cargo and structured logs"
+description = "Native Codex PreToolUse context gateway for Cargo, logs, and Git deltas"
 license = "MIT OR Apache-2.0"
 
 [dependencies]

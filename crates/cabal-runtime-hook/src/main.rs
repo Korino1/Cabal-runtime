@@ -3,8 +3,8 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 
 use cabal_runtime_hook::{
-    HookOutput, PostToolUseInput, PreToolUseInput, execute_cargo_request, execute_log_request,
-    fallback_output, prepare_pre_tool_use, project_post_tool_use,
+    HookOutput, PostToolUseInput, PreToolUseInput, execute_cargo_request, execute_git_request,
+    execute_log_request, fallback_output, prepare_pre_tool_use, project_post_tool_use,
 };
 
 fn main() {
@@ -14,8 +14,29 @@ fn main() {
         Some(command) if command == "pre-tool-use" => run_pre_tool_use(),
         Some(command) if command == "execute-cargo" => run_execute_cargo(args),
         Some(command) if command == "execute-log" => run_execute_log(args),
+        Some(command) if command == "execute-git" => run_execute_git(args),
         Some(_) => print_output(fallback_output()),
         None => run_post_tool_use(),
+    }
+}
+
+fn run_execute_git(mut args: impl Iterator<Item = std::ffi::OsString>) {
+    let Some(flag) = args.next() else {
+        print_output(fallback_output());
+        return;
+    };
+    let Some(request_path) = args.next() else {
+        print_output(fallback_output());
+        return;
+    };
+    if flag != "--request" || args.next().is_some() {
+        print_output(fallback_output());
+        return;
+    }
+
+    match execute_git_request(&PathBuf::from(request_path)) {
+        Ok(projection) => println!("{projection}"),
+        Err(_) => print_output(fallback_output()),
     }
 }
 

@@ -33,6 +33,19 @@ Simple report reads are redirected when their file name identifies a supported f
 
 Simple `cargo nextest run ...` calls are also recognized. JUnit `system-out`/`system-err`, repetitive log lines, and non-actionable report structure remain in the local raw artifact. The projection preserves suite/test identity, pass/fail/skip/error counts, rule IDs, messages, primary locations, and related SARIF locations. Malformed structured input produces `normalization_failed`; it never produces a false success verdict.
 
+### Git Delta Gateway
+
+The gateway transparently rewrites exactly four read-only command forms:
+
+- `git status`;
+- `git diff`;
+- `git diff --cached`;
+- `git show <revision>`, where the revision is a single bounded commit expression.
+
+Git runs directly without a shell, external diff drivers, or textconv. The model receives changed paths, staged/unstaged/untracked state, add/modify/delete/rename markers, file classification, binary markers, additions/deletions, and bounded hunk ranges. Patch bodies are retained only under the repository's Git service directory and are not returned to the model. Requests and artifacts do not change the worktree, index, refs, or visible Git status.
+
+The gateway rejects flags, pathspecs, revision ranges, redirection, and composed shell commands. This module does not claim symbol, API, or behavioral interpretation.
+
 ### Supporting Normalizers
 
 - `cabal-observe` normalizes Cargo/rustc JSON and textual test output.
@@ -66,7 +79,7 @@ cargo +nightly test --workspace --all-targets
 cargo +nightly clippy --workspace --all-targets -- -D warnings
 ```
 
-CI runs the test suite on Windows and Linux. A regression test verifies that a noisy JUnit report is reduced by more than 10x while its actionable failure evidence remains available to the model.
+CI runs the test suite on Windows and Linux. Regression tests verify JUnit context reduction and prove that all Git gateway queries leave HEAD, index, and visible status unchanged while patch bodies remain outside model-facing output.
 
 ## License
 
@@ -81,5 +94,9 @@ Cabal Runtime переносит детерминированную технич
 Реализованный Cargo Gateway обрабатывает простые команды `cargo build`, `cargo check`, `cargo clippy` и `cargo test`. Полные stdout и stderr сохраняются локально в игнорируемом каталоге `.cabal/artifacts/`, а в контекст модели возвращаются итог, коды ошибок, важные диагностики, координаты в исходниках и сводка тестов.
 
 Реализованный Artifact and Log Gateway перехватывает простое чтение файлов `*.junit.xml`, `*.sarif`, `*.sarif.json`, `*.nextest.log` и `*.log`, а также простые вызовы `cargo nextest run`. Он поддерживает JUnit XML, SARIF 2.1.0, текст nextest и ограниченную обработку обычных логов. В контексте сохраняются идентификаторы suite/test, счётчики pass/fail/skip/error, rule ID, сообщения и координаты. `system-out`, `system-err`, повторяющиеся строки и служебная структура остаются только в локальном сыром артефакте. Повреждённый структурированный отчёт получает статус `normalization_failed` и не может быть объявлен успешным.
+
+Реализованный Git Delta Gateway незаметно перехватывает только четыре read-only формы: `git status`, `git diff`, `git diff --cached` и `git show <revision>` для одного ограниченного выражения commit. Git запускается напрямую без shell, внешних diff-драйверов и textconv. Модель получает пути, staged/unstaged/untracked состояние, тип изменения, классификацию файла, binary-маркеры, счётчики additions/deletions и ограниченные диапазоны хунков. Тело patch остаётся только в служебном каталоге Git и не возвращается модели. Gateway не изменяет worktree, index, refs или видимый Git status.
+
+Флаги, pathspec, диапазоны revisions, перенаправление и составные shell-команды не перехватываются. Модуль не заявляет анализ символов, API или поведения: это отдельные будущие уровни.
 
 Прозрачность действует для перечисленных поддерживаемых путей hook API. Неизвестные и составные shell-команды не изменяются; проект не заявляет перехват всех возможных инструментов Codex. Каждый нормализатор является отдельным Rust-модулем, поэтому модули выполняют свои задачи независимо и объединяются только в границе нативного gateway.

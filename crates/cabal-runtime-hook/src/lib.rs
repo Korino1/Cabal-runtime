@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cabal_delta::{DeltaPack, normalize_bytes as normalize_diff};
+use cabal_delta::{
+    DeltaPack, GitStatusPack, StatusKind, normalize_bytes as normalize_diff, normalize_status_bytes,
+};
 use cabal_log::{
     InputKind as LogInputKind, LogPack, Verdict as LogVerdict, normalize_bytes as normalize_log,
 };
@@ -85,6 +87,21 @@ enum LogExecutionSource {
     Nextest { cargo_args: Vec<String> },
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct GitExecutionRequest {
+    cwd: PathBuf,
+    query: GitQuery,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "query", rename_all = "snake_case")]
+enum GitQuery {
+    Status,
+    Diff,
+    DiffCached,
+    Show { revision: String },
+}
+
 #[derive(Debug, Serialize)]
 pub struct HookOutput {
     #[serde(rename = "continue")]
@@ -109,6 +126,7 @@ enum ModelProjection {
     Test(BuildProjection),
     Diff(DiffProjection),
     Log(LogProjection),
+    Git(GitProjection),
     Command(CommandProjection),
 }
 
@@ -127,6 +145,66 @@ struct DiffProjection {
     files: Vec<ModelFileDelta>,
     summary: ModelDiffSummary,
     completeness: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GitProjection {
+    query: String,
+    status: String,
+    files: Vec<ModelGitFile>,
+    summary: ModelGitSummary,
+    omitted_files: u64,
+    omitted_hunks: u64,
+    completeness: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelGitFile {
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    change_kind: Option<String>,
+    classification: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worktree_status: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    untracked: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    binary: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hunks: Vec<ModelHunk>,
+    #[serde(skip_serializing_if = "is_zero")]
+    additions: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    deletions: u64,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct ModelGitSummary {
+    files_changed: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    files_added: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    files_deleted: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    files_renamed: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    binary_files: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    additions: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    deletions: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    staged: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    unstaged: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    untracked: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    conflicts: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -289,6 +367,9 @@ pub fn prepare_pre_tool_use(
     } else if let Some(request) = parse_simple_log_command(command, &input.cwd) {
         let request_path = persist_execution_request(&input.cwd, &request)?;
         build_executor_command(executable, "execute-log", &request_path)
+    } else if let Some(request) = parse_simple_git_command(command, &input.cwd) {
+        let request_path = persist_git_execution_request(&input.cwd, &request)?;
+        build_executor_command(executable, "execute-git", &request_path)
     } else {
         return Ok(None);
     };
@@ -302,6 +383,96 @@ pub fn prepare_pre_tool_use(
             },
         },
     }))
+}
+
+/// Executes a contract-approved, read-only Git query without a shell.
+pub fn execute_git_request(request_path: &Path) -> Result<String, HookError> {
+    let request = serde_json::from_slice::<GitExecutionRequest>(&fs::read(request_path)?)?;
+    let workspace = fs::canonicalize(&request.cwd)?;
+    let artifact_root = git_runtime_root(&workspace).join("artifacts");
+    let (query_name, args) = match &request.query {
+        GitQuery::Status => (
+            "status",
+            vec![
+                "--no-pager".to_owned(),
+                "-c".to_owned(),
+                "core.quotePath=false".to_owned(),
+                "status".to_owned(),
+                "--porcelain=v2".to_owned(),
+                "-z".to_owned(),
+                "--untracked-files=all".to_owned(),
+                "--ignore-submodules=none".to_owned(),
+            ],
+        ),
+        GitQuery::Diff => ("diff", safe_diff_args(false)),
+        GitQuery::DiffCached => ("diff_cached", safe_diff_args(true)),
+        GitQuery::Show { revision } => (
+            "show",
+            vec![
+                "--no-pager".to_owned(),
+                "-c".to_owned(),
+                "core.quotePath=false".to_owned(),
+                "show".to_owned(),
+                "--format=".to_owned(),
+                "--no-ext-diff".to_owned(),
+                "--no-textconv".to_owned(),
+                "--find-renames".to_owned(),
+                "--unified=0".to_owned(),
+                format!("{revision}^{{commit}}"),
+                "--".to_owned(),
+            ],
+        ),
+    };
+    let output = Command::new("git")
+        .args(&args)
+        .current_dir(&workspace)
+        .stdin(Stdio::null())
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()?;
+    let mut complete_raw = output.stdout.clone();
+    if !output.stderr.is_empty() {
+        complete_raw.extend_from_slice(b"\n--- stderr ---\n");
+        complete_raw.extend_from_slice(&output.stderr);
+    }
+    persist_unclassified_raw(&complete_raw, &artifact_root)?;
+
+    let projection = if !output.status.success() {
+        unknown_git_projection(query_name, "Git query failed; no clean state is claimed")
+    } else {
+        match request.query {
+            GitQuery::Status => normalize_status_bytes(&output.stdout, &artifact_root)
+                .map(project_git_status)
+                .unwrap_or_else(|_| {
+                    unknown_git_projection(query_name, "Git status normalization failed")
+                }),
+            GitQuery::Diff | GitQuery::DiffCached | GitQuery::Show { .. } => {
+                normalize_diff(&output.stdout, &artifact_root)
+                    .map(|pack| project_git_diff(query_name, pack))
+                    .unwrap_or_else(|_| {
+                        unknown_git_projection(query_name, "Git diff normalization failed")
+                    })
+            }
+        }
+    };
+    serde_json::to_string(&ModelProjection::Git(projection)).map_err(Into::into)
+}
+
+fn safe_diff_args(cached: bool) -> Vec<String> {
+    let mut args = vec![
+        "--no-pager".to_owned(),
+        "-c".to_owned(),
+        "core.quotePath=false".to_owned(),
+        "diff".to_owned(),
+        "--no-ext-diff".to_owned(),
+        "--no-textconv".to_owned(),
+        "--find-renames".to_owned(),
+        "--unified=0".to_owned(),
+    ];
+    if cached {
+        args.push("--cached".to_owned());
+    }
+    args.push("--".to_owned());
+    args
 }
 
 /// Executes an approved report read or nextest invocation without a shell.
@@ -499,6 +670,40 @@ fn parse_simple_log_command(command: &str, cwd: &Path) -> Option<LogExecutionReq
     })
 }
 
+fn parse_simple_git_command(command: &str, cwd: &Path) -> Option<GitExecutionRequest> {
+    let words = command.split_whitespace().collect::<Vec<_>>();
+    let query = match words.as_slice() {
+        ["git", "status"] => GitQuery::Status,
+        ["git", "diff"] => GitQuery::Diff,
+        ["git", "diff", "--cached"] => GitQuery::DiffCached,
+        ["git", "show", revision] if is_safe_revision(revision) => GitQuery::Show {
+            revision: (*revision).to_owned(),
+        },
+        _ => return None,
+    };
+    Some(GitExecutionRequest {
+        cwd: cwd.to_path_buf(),
+        query,
+    })
+}
+
+fn is_safe_revision(revision: &str) -> bool {
+    !revision.is_empty()
+        && revision.len() <= 128
+        && !revision.starts_with('-')
+        && !revision.contains("..")
+        && !revision.contains("^@")
+        && !revision.contains("^!")
+        && !revision.contains("^-")
+        && revision.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'_' | b'-' | b'.' | b'/' | b'~' | b'^' | b'@' | b'{' | b'}' | b'+'
+                )
+        })
+}
+
 fn infer_log_kind(path: &str) -> Option<LogInputKind> {
     let path = path.to_ascii_lowercase();
     if path.ends_with(".junit.xml") || path.ends_with("junit-results.xml") {
@@ -527,8 +732,18 @@ fn is_safe_cargo_word(word: &str) -> bool {
 
 fn persist_execution_request(cwd: &Path, request: &impl Serialize) -> Result<PathBuf, HookError> {
     let request_root = cwd.join(".cabal").join("requests");
-    fs::create_dir_all(&request_root)?;
+    persist_request_at(&request_root, request)
+}
 
+fn persist_git_execution_request(
+    cwd: &Path,
+    request: &impl Serialize,
+) -> Result<PathBuf, HookError> {
+    persist_request_at(&git_runtime_root(cwd).join("requests"), request)
+}
+
+fn persist_request_at(root: &Path, request: &impl Serialize) -> Result<PathBuf, HookError> {
+    fs::create_dir_all(root)?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| HookError::InvalidInput("system clock is before Unix epoch"))?
@@ -538,9 +753,30 @@ fn persist_execution_request(cwd: &Path, request: &impl Serialize) -> Result<Pat
         "{:x}",
         Sha256::digest([payload.as_slice(), timestamp.to_string().as_bytes()].concat())
     );
-    let path = request_root.join(format!("{id}.json"));
+    let path = root.join(format!("{id}.json"));
     fs::write(&path, payload)?;
     Ok(path)
+}
+
+fn git_runtime_root(cwd: &Path) -> PathBuf {
+    for directory in cwd.ancestors() {
+        let dot_git = directory.join(".git");
+        if dot_git.is_dir() {
+            return dot_git.join("cabal-runtime");
+        }
+        if let Ok(pointer) = fs::read_to_string(&dot_git)
+            && let Some(path) = pointer.trim().strip_prefix("gitdir: ")
+        {
+            let path = PathBuf::from(path);
+            let git_dir = if path.is_absolute() {
+                path
+            } else {
+                directory.join(path)
+            };
+            return git_dir.join("cabal-runtime");
+        }
+    }
+    cwd.join(".cabal").join("git-runtime")
 }
 
 fn build_executor_command(executable: &Path, subcommand: &str, request_path: &Path) -> String {
@@ -888,6 +1124,141 @@ fn project_diff(pack: DeltaPack) -> DiffProjection {
         },
         completeness: pack.completeness,
     }
+}
+
+fn project_git_diff(query: &str, pack: DeltaPack) -> GitProjection {
+    let status = match pack.verdict {
+        cabal_delta::DeltaVerdict::Clean => "clean",
+        cabal_delta::DeltaVerdict::Changed => "changed",
+    }
+    .to_owned();
+    let files = pack
+        .files
+        .into_iter()
+        .map(|file| {
+            let path = file
+                .new_path
+                .clone()
+                .or_else(|| file.old_path.clone())
+                .unwrap_or_default();
+            let change_kind = format!("{:?}", file.change_kind).to_ascii_lowercase();
+            ModelGitFile {
+                path,
+                old_path: file.old_path,
+                change_kind: Some(change_kind.clone()),
+                classification: format!("{:?}", file.classification).to_ascii_lowercase(),
+                index_status: (query == "diff_cached").then(|| change_kind.clone()),
+                worktree_status: (query == "diff").then_some(change_kind),
+                untracked: false,
+                binary: file.is_binary,
+                hunks: file
+                    .hunks
+                    .into_iter()
+                    .map(|hunk| ModelHunk {
+                        old_start: hunk.old_start,
+                        old_lines: hunk.old_lines,
+                        new_start: hunk.new_start,
+                        new_lines: hunk.new_lines,
+                    })
+                    .collect(),
+                additions: file.additions,
+                deletions: file.deletions,
+            }
+        })
+        .collect();
+    GitProjection {
+        query: query.to_owned(),
+        status,
+        files,
+        summary: ModelGitSummary {
+            files_changed: pack.summary.files_changed,
+            files_added: pack.summary.files_added,
+            files_deleted: pack.summary.files_deleted,
+            files_renamed: pack.summary.files_renamed,
+            binary_files: pack.summary.binary_files,
+            additions: pack.summary.additions,
+            deletions: pack.summary.deletions,
+            staged: if query == "diff_cached" {
+                pack.summary.files_changed
+            } else {
+                0
+            },
+            unstaged: if query == "diff" {
+                pack.summary.files_changed
+            } else {
+                0
+            },
+            ..ModelGitSummary::default()
+        },
+        omitted_files: pack.omitted_files,
+        omitted_hunks: pack.omitted_hunks,
+        completeness: pack.completeness,
+    }
+}
+
+fn project_git_status(pack: GitStatusPack) -> GitProjection {
+    let files = pack
+        .entries
+        .into_iter()
+        .map(|entry| ModelGitFile {
+            path: entry.path,
+            old_path: entry.original_path,
+            change_kind: None,
+            classification: format!("{:?}", entry.classification).to_ascii_lowercase(),
+            index_status: entry.index_status.map(status_kind_name),
+            worktree_status: entry.worktree_status.map(status_kind_name),
+            untracked: entry.untracked,
+            binary: false,
+            hunks: Vec::new(),
+            additions: 0,
+            deletions: 0,
+        })
+        .collect();
+    GitProjection {
+        query: "status".to_owned(),
+        status: if pack.summary.files_changed == 0 {
+            "clean"
+        } else {
+            "changed"
+        }
+        .to_owned(),
+        files,
+        summary: ModelGitSummary {
+            files_changed: pack.summary.files_changed,
+            staged: pack.summary.staged,
+            unstaged: pack.summary.unstaged,
+            untracked: pack.summary.untracked,
+            conflicts: pack.summary.conflicts,
+            ..ModelGitSummary::default()
+        },
+        omitted_files: pack.omitted_files,
+        omitted_hunks: 0,
+        completeness: pack.completeness,
+    }
+}
+
+fn unknown_git_projection(query: &str, completeness: &str) -> GitProjection {
+    GitProjection {
+        query: query.to_owned(),
+        status: "unknown".to_owned(),
+        files: Vec::new(),
+        summary: ModelGitSummary::default(),
+        omitted_files: 0,
+        omitted_hunks: 0,
+        completeness: completeness.to_owned(),
+    }
+}
+
+fn status_kind_name(kind: StatusKind) -> String {
+    format!("{kind:?}").to_ascii_lowercase()
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 pub fn artifact_root_for(cwd: &Path) -> PathBuf {
@@ -1306,5 +1677,145 @@ mod tests {
                 ]
             }
         );
+    }
+
+    #[test]
+    fn git_grammar_is_exact_and_rejects_composition_ranges_and_flags() {
+        for (command, expected) in [
+            ("git status", GitQuery::Status),
+            ("git diff", GitQuery::Diff),
+            ("git diff --cached", GitQuery::DiffCached),
+            (
+                "git show HEAD~1",
+                GitQuery::Show {
+                    revision: "HEAD~1".to_owned(),
+                },
+            ),
+        ] {
+            assert_eq!(
+                parse_simple_git_command(command, Path::new("."))
+                    .unwrap()
+                    .query,
+                expected
+            );
+        }
+        for command in [
+            "git status --short",
+            "git diff --stat",
+            "git diff -- src/lib.rs",
+            "git diff && echo leaked",
+            "git show --stat",
+            "git show HEAD..main",
+            "git show --output=leak HEAD",
+            "git show HEAD:src/lib.rs",
+        ] {
+            assert!(parse_simple_git_command(command, Path::new(".")).is_none());
+        }
+    }
+
+    #[test]
+    fn git_gateway_is_read_only_and_excludes_patch_bodies() {
+        let workspace = tempfile::tempdir().unwrap();
+        run_git(workspace.path(), &["init", "-q"]);
+        run_git(
+            workspace.path(),
+            &["config", "user.email", "cabal@example.invalid"],
+        );
+        run_git(workspace.path(), &["config", "user.name", "Cabal Test"]);
+        fs::create_dir_all(workspace.path().join("src")).unwrap();
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            "pub fn original() {}\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("old name.rs"), "fn old() {}\n").unwrap();
+        run_git(workspace.path(), &["add", "."]);
+        run_git(workspace.path(), &["commit", "-qm", "initial"]);
+
+        let noisy_change = format!(
+            "pub fn changed() {{ /* RAW_UNSTAGED_PATCH_MARKER {} */ }}\n",
+            "x".repeat(10_000)
+        );
+        fs::write(workspace.path().join("src/lib.rs"), noisy_change).unwrap();
+        run_git(workspace.path(), &["mv", "old name.rs", "юникод name.rs"]);
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "# RAW_UNTRACKED_MARKER\n",
+        )
+        .unwrap();
+
+        let before = git_state(workspace.path());
+        let raw_diff = run_git(
+            workspace.path(),
+            &["diff", "--no-ext-diff", "--no-textconv"],
+        );
+        let status = execute_git(workspace.path(), GitQuery::Status);
+        let diff = execute_git(workspace.path(), GitQuery::Diff);
+        let cached = execute_git(workspace.path(), GitQuery::DiffCached);
+        let show = execute_git(
+            workspace.path(),
+            GitQuery::Show {
+                revision: "HEAD".to_owned(),
+            },
+        );
+        let after = git_state(workspace.path());
+
+        assert_eq!(before, after);
+        assert!(status.contains("\"operation\":\"git\""));
+        assert!(status.contains("\"query\":\"status\""));
+        assert!(status.contains("Cargo.toml"));
+        assert!(status.contains("\"classification\":\"manifest\""));
+        assert!(status.contains("юникод name.rs"));
+        assert!(status.contains("\"staged\":1"));
+        assert!(status.contains("\"unstaged\":1"));
+        assert!(status.contains("\"untracked\":1"));
+        assert!(diff.contains("src/lib.rs"));
+        assert!(diff.contains("\"unstaged\":1"));
+        assert!(!diff.contains("RAW_UNSTAGED_PATCH_MARKER"));
+        assert!(diff.len() * 10 < raw_diff.len());
+        assert!(cached.contains("юникод name.rs"));
+        assert!(cached.contains("\"staged\":1"));
+        assert!(!cached.contains("fn old"));
+        assert!(show.contains("\"query\":\"show\""));
+        assert!(!show.contains("pub fn original"));
+        for projection in [&status, &diff, &cached, &show] {
+            assert!(!projection.contains("artifact"));
+            assert!(!projection.contains("sha256"));
+            assert!(!projection.contains(".cabal"));
+        }
+    }
+
+    fn execute_git(cwd: &Path, query: GitQuery) -> String {
+        let request = GitExecutionRequest {
+            cwd: cwd.to_path_buf(),
+            query,
+        };
+        let request_path = persist_git_execution_request(cwd, &request).unwrap();
+        execute_git_request(&request_path).unwrap()
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) -> Vec<u8> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn git_state(cwd: &Path) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        (
+            run_git(cwd, &["rev-parse", "HEAD"]),
+            run_git(
+                cwd,
+                &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+            ),
+            run_git(cwd, &["diff", "--cached", "--binary"]),
+        )
     }
 }
