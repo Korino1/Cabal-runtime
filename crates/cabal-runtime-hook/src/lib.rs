@@ -1,7 +1,9 @@
-//! Converts supported Codex `PostToolUse` payloads into model-safe projections.
+//! Rewrites supported Codex `PreToolUse` operations to native model-safe gateways.
 //!
 //! Raw tool output is never placed in the returned hook message. It is retained
 //! only in local artifacts by the normalizer crates.
+
+#![forbid(unsafe_code)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,6 +11,9 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cabal_delta::{DeltaPack, normalize_bytes as normalize_diff};
+use cabal_log::{
+    InputKind as LogInputKind, LogPack, Verdict as LogVerdict, normalize_bytes as normalize_log,
+};
 use cabal_observe::{InputKind, ObservationPack, normalize_bytes as normalize_observation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -67,6 +72,19 @@ enum CargoExecutionKind {
     TestText,
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct LogExecutionRequest {
+    cwd: PathBuf,
+    source: LogExecutionSource,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "source", rename_all = "snake_case")]
+enum LogExecutionSource {
+    File { path: PathBuf, kind: LogInputKind },
+    Nextest { cargo_args: Vec<String> },
+}
+
 #[derive(Debug, Serialize)]
 pub struct HookOutput {
     #[serde(rename = "continue")]
@@ -90,6 +108,7 @@ enum ModelProjection {
     Build(BuildProjection),
     Test(BuildProjection),
     Diff(DiffProjection),
+    Log(LogProjection),
     Command(CommandProjection),
 }
 
@@ -117,10 +136,33 @@ struct CommandProjection {
 }
 
 #[derive(Debug, Serialize)]
+struct LogProjection {
+    format: String,
+    status: String,
+    diagnostics: Vec<ModelDiagnostic>,
+    counts: ModelLogCounts,
+    omitted: u64,
+    completeness: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelLogCounts {
+    total: u64,
+    passed: u64,
+    failed: u64,
+    skipped: u64,
+    errors: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct ModelDiagnostic {
     kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suite: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    test: Option<String>,
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     location: Option<String>,
@@ -176,6 +218,7 @@ pub enum HookError {
     Json(serde_json::Error),
     Observation(cabal_observe::NormalizeError),
     Delta(cabal_delta::DeltaError),
+    Log(cabal_log::NormalizeError),
     InvalidInput(&'static str),
 }
 
@@ -186,6 +229,7 @@ impl std::fmt::Display for HookError {
             Self::Json(error) => write!(formatter, "JSON error: {error}"),
             Self::Observation(error) => write!(formatter, "observation error: {error}"),
             Self::Delta(error) => write!(formatter, "delta error: {error}"),
+            Self::Log(error) => write!(formatter, "log error: {error}"),
             Self::InvalidInput(message) => write!(formatter, "invalid hook input: {message}"),
         }
     }
@@ -217,6 +261,12 @@ impl From<cabal_delta::DeltaError> for HookError {
     }
 }
 
+impl From<cabal_log::NormalizeError> for HookError {
+    fn from(error: cabal_log::NormalizeError) -> Self {
+        Self::Log(error)
+    }
+}
+
 /// Rewrites a narrow, shell-free Cargo invocation to the native executor.
 /// Unsupported command shapes are left untouched so the hook never changes
 /// semantics it cannot reproduce without a shell.
@@ -233,12 +283,15 @@ pub fn prepare_pre_tool_use(
         .get("command")
         .and_then(Value::as_str)
         .ok_or(HookError::InvalidInput("Bash command is missing"))?;
-    let Some(request) = parse_simple_cargo_command(command, &input.cwd) else {
+    let rewritten_command = if let Some(request) = parse_simple_cargo_command(command, &input.cwd) {
+        let request_path = persist_execution_request(&input.cwd, &request)?;
+        build_executor_command(executable, "execute-cargo", &request_path)
+    } else if let Some(request) = parse_simple_log_command(command, &input.cwd) {
+        let request_path = persist_execution_request(&input.cwd, &request)?;
+        build_executor_command(executable, "execute-log", &request_path)
+    } else {
         return Ok(None);
     };
-
-    let request_path = persist_execution_request(&request)?;
-    let rewritten_command = build_executor_command(executable, &request_path);
 
     Ok(Some(PreToolUseOutput {
         hook_specific_output: PreToolUseSpecificOutput {
@@ -249,6 +302,58 @@ pub fn prepare_pre_tool_use(
             },
         },
     }))
+}
+
+/// Executes an approved report read or nextest invocation without a shell.
+pub fn execute_log_request(request_path: &Path) -> Result<String, HookError> {
+    let request = serde_json::from_slice::<LogExecutionRequest>(&fs::read(request_path)?)?;
+    let artifact_root = artifact_root_for(&request.cwd);
+
+    let (kind, raw, success) = match request.source {
+        LogExecutionSource::File { path, kind } => {
+            let workspace = fs::canonicalize(&request.cwd)?;
+            let path = fs::canonicalize(path)?;
+            if !path.starts_with(&workspace) || !path.is_file() {
+                return Err(HookError::InvalidInput(
+                    "report path is outside the workspace",
+                ));
+            }
+            (kind, fs::read(path)?, true)
+        }
+        LogExecutionSource::Nextest { cargo_args } => {
+            let output = Command::new("cargo")
+                .args(&cargo_args)
+                .current_dir(&request.cwd)
+                .stdin(Stdio::null())
+                .output()?;
+            let mut raw = output.stdout;
+            if !output.stderr.is_empty() {
+                raw.extend_from_slice(b"\n--- stderr ---\n");
+                raw.extend_from_slice(&output.stderr);
+            }
+            (LogInputKind::NextestText, raw, output.status.success())
+        }
+    };
+
+    let projection = match normalize_log(kind, &raw, success, &artifact_root) {
+        Ok(pack) => ModelProjection::Log(project_log(pack)),
+        Err(_) => ModelProjection::Log(LogProjection {
+            format: log_kind_name(kind).to_owned(),
+            status: "normalization_failed".to_owned(),
+            diagnostics: Vec::new(),
+            counts: ModelLogCounts {
+                total: 0,
+                passed: 0,
+                failed: 0,
+                skipped: 0,
+                errors: 0,
+            },
+            omitted: 0,
+            completeness: "structured input was invalid; no semantic success is claimed".to_owned(),
+        }),
+    };
+
+    serde_json::to_string(&projection).map_err(Into::into)
 }
 
 /// Executes an approved Cargo request without invoking a shell. The only data
@@ -352,6 +457,63 @@ fn parse_simple_cargo_command(command: &str, cwd: &Path) -> Option<CargoExecutio
     })
 }
 
+fn parse_simple_log_command(command: &str, cwd: &Path) -> Option<LogExecutionRequest> {
+    let words = command.split_whitespace().collect::<Vec<_>>();
+    if words.is_empty() || words.iter().any(|word| !is_safe_cargo_word(word)) {
+        return None;
+    }
+
+    if words[0] == "cargo" {
+        let action_index = if words.get(1).is_some_and(|word| word.starts_with('+')) {
+            2
+        } else {
+            1
+        };
+        if words.get(action_index) == Some(&"nextest")
+            && words.get(action_index + 1) == Some(&"run")
+        {
+            return Some(LogExecutionRequest {
+                cwd: cwd.to_path_buf(),
+                source: LogExecutionSource::Nextest {
+                    cargo_args: words[1..].iter().map(|word| (*word).to_owned()).collect(),
+                },
+            });
+        }
+        return None;
+    }
+
+    let path_word = match words.as_slice() {
+        ["cat", path] | ["Get-Content", path] | ["Get-Content", "-Raw", path] => *path,
+        _ => return None,
+    };
+    let kind = infer_log_kind(path_word)?;
+    let path = PathBuf::from(path_word);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    Some(LogExecutionRequest {
+        cwd: cwd.to_path_buf(),
+        source: LogExecutionSource::File { path, kind },
+    })
+}
+
+fn infer_log_kind(path: &str) -> Option<LogInputKind> {
+    let path = path.to_ascii_lowercase();
+    if path.ends_with(".junit.xml") || path.ends_with("junit-results.xml") {
+        Some(LogInputKind::JunitXml)
+    } else if path.ends_with(".sarif") || path.ends_with(".sarif.json") {
+        Some(LogInputKind::SarifJson)
+    } else if path.ends_with(".nextest.log") {
+        Some(LogInputKind::NextestText)
+    } else if path.ends_with(".log") {
+        Some(LogInputKind::GenericText)
+    } else {
+        None
+    }
+}
+
 fn is_safe_cargo_word(word: &str) -> bool {
     !word.is_empty()
         && word.bytes().all(|byte| {
@@ -363,8 +525,8 @@ fn is_safe_cargo_word(word: &str) -> bool {
         })
 }
 
-fn persist_execution_request(request: &CargoExecutionRequest) -> Result<PathBuf, HookError> {
-    let request_root = request.cwd.join(".cabal").join("requests");
+fn persist_execution_request(cwd: &Path, request: &impl Serialize) -> Result<PathBuf, HookError> {
+    let request_root = cwd.join(".cabal").join("requests");
     fs::create_dir_all(&request_root)?;
 
     let timestamp = SystemTime::now()
@@ -381,21 +543,90 @@ fn persist_execution_request(request: &CargoExecutionRequest) -> Result<PathBuf,
     Ok(path)
 }
 
-fn build_executor_command(executable: &Path, request_path: &Path) -> String {
+fn build_executor_command(executable: &Path, subcommand: &str, request_path: &Path) -> String {
     let executable = executable.to_string_lossy();
     let request_path = request_path.to_string_lossy();
     if cfg!(windows) {
         format!(
-            "& {} execute-cargo --request {}",
+            "& {} {} --request {}",
             quote_powershell(&executable),
+            subcommand,
             quote_powershell(&request_path)
         )
     } else {
         format!(
-            "{} execute-cargo --request {}",
+            "{} {} --request {}",
             quote_posix_shell(&executable),
+            subcommand,
             quote_posix_shell(&request_path)
         )
+    }
+}
+
+fn project_log(pack: LogPack) -> LogProjection {
+    LogProjection {
+        format: log_kind_name(pack.kind).to_owned(),
+        status: match pack.verdict {
+            LogVerdict::Passed => "passed",
+            LogVerdict::Failed => "failed",
+            LogVerdict::Unknown => "unknown",
+        }
+        .to_owned(),
+        diagnostics: pack
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| ModelDiagnostic {
+                kind: format!("{:?}", diagnostic.category).to_ascii_lowercase(),
+                code: diagnostic.rule_id,
+                suite: diagnostic.suite,
+                test: diagnostic.test,
+                message: diagnostic.message,
+                location: diagnostic.file.as_ref().map(|file| {
+                    format!(
+                        "{}:{}:{}",
+                        file,
+                        diagnostic.line.unwrap_or(1),
+                        diagnostic.column.unwrap_or(1)
+                    )
+                }),
+                related_locations: diagnostic
+                    .related_locations
+                    .iter()
+                    .filter_map(|location| {
+                        location.file.as_ref().map(|file| {
+                            format!(
+                                "{}:{}:{}",
+                                file,
+                                location.line.unwrap_or(1),
+                                location.column.unwrap_or(1)
+                            )
+                        })
+                    })
+                    .collect(),
+            })
+            .collect(),
+        counts: ModelLogCounts {
+            total: pack.counts.total,
+            passed: pack.counts.passed,
+            failed: pack.counts.failed,
+            skipped: pack.counts.skipped,
+            errors: pack.counts.errors,
+        },
+        omitted: pack.omitted.as_ref().map_or(0, |omitted| omitted.count),
+        completeness: if pack.complete {
+            "all supported semantic events retained".to_owned()
+        } else {
+            "bounded projection; omitted or contradictory input is reported".to_owned()
+        },
+    }
+}
+
+fn log_kind_name(kind: LogInputKind) -> &'static str {
+    match kind {
+        LogInputKind::JunitXml => "junit_xml",
+        LogInputKind::SarifJson => "sarif_2_1_0",
+        LogInputKind::GenericText => "generic_text_log",
+        LogInputKind::NextestText => "nextest_text",
     }
 }
 
@@ -587,6 +818,8 @@ fn project_observation(pack: ObservationPack) -> BuildProjection {
             .map(|diagnostic| ModelDiagnostic {
                 kind: diagnostic.kind,
                 code: diagnostic.code,
+                suite: None,
+                test: None,
                 message: diagnostic.message,
                 location: diagnostic.primary_location.as_ref().map(format_location),
                 related_locations: diagnostic
@@ -917,5 +1150,161 @@ mod tests {
             panic!("expected test projection");
         };
         assert_eq!(result.status, "failed");
+    }
+
+    #[test]
+    fn rewrites_a_supported_report_read_to_the_log_executor() {
+        let workspace = tempfile::tempdir().unwrap();
+        let report = workspace.path().join("results.junit.xml");
+        fs::write(&report, "<testsuite/>").unwrap();
+        let input = PreToolUseInput {
+            hook_event_name: "PreToolUse".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            tool_name: "Bash".to_owned(),
+            tool_input: serde_json::json!({
+                "command": "Get-Content results.junit.xml"
+            }),
+        };
+
+        let output = prepare_pre_tool_use(input, Path::new("/opt/cabal-runtime-hook"))
+            .unwrap()
+            .unwrap();
+        let serialized = serde_json::to_string(&output).unwrap();
+
+        assert!(serialized.contains("execute-log"));
+        assert!(!serialized.contains("Get-Content"));
+        let request = fs::read_dir(workspace.path().join(".cabal/requests"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let request =
+            serde_json::from_slice::<LogExecutionRequest>(&fs::read(request.path()).unwrap())
+                .unwrap();
+        assert_eq!(
+            request.source,
+            LogExecutionSource::File {
+                path: report,
+                kind: LogInputKind::JunitXml
+            }
+        );
+    }
+
+    #[test]
+    fn report_grammar_rejects_composition_and_unknown_suffixes() {
+        let workspace = tempfile::tempdir().unwrap();
+        for command in [
+            "Get-Content results.junit.xml; echo leaked",
+            "cat report.xml",
+            "Get-Content report.txt",
+            "cargo nextest run && echo leaked",
+        ] {
+            let input = PreToolUseInput {
+                hook_event_name: "PreToolUse".to_owned(),
+                cwd: workspace.path().to_path_buf(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({ "command": command }),
+            };
+            assert!(
+                prepare_pre_tool_use(input, Path::new("/opt/cabal-runtime-hook"))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn executes_junit_read_without_returning_raw_or_artifact_metadata() {
+        let workspace = tempfile::tempdir().unwrap();
+        let report = workspace.path().join("results.junit.xml");
+        let raw = format!(
+            r#"<testsuite name="integration"><testcase name="fails"><failure message="assertion failed" file="src/lib.rs" line="9"/></testcase><system-out>UNIQUE_RAW_MARKER{}</system-out></testsuite>"#,
+            "x".repeat(10_000)
+        );
+        fs::write(&report, &raw).unwrap();
+        let request = LogExecutionRequest {
+            cwd: workspace.path().to_path_buf(),
+            source: LogExecutionSource::File {
+                path: report,
+                kind: LogInputKind::JunitXml,
+            },
+        };
+        let request_path = persist_execution_request(workspace.path(), &request).unwrap();
+
+        let projection = execute_log_request(&request_path).unwrap();
+
+        assert!(projection.contains("\"operation\":\"log\""));
+        assert!(projection.contains("\"format\":\"junit_xml\""));
+        assert!(projection.contains("\"suite\":\"integration\""));
+        assert!(projection.contains("\"test\":\"fails\""));
+        assert!(projection.contains("src/lib.rs:9:1"));
+        assert!(!projection.contains("UNIQUE_RAW_MARKER"));
+        assert!(!projection.contains("artifact"));
+        assert!(!projection.contains("sha256"));
+        assert!(!projection.contains("cabal"));
+        assert!(projection.len() * 10 < raw.len());
+    }
+
+    #[test]
+    fn malformed_structured_report_never_claims_success() {
+        let workspace = tempfile::tempdir().unwrap();
+        let report = workspace.path().join("broken.junit.xml");
+        fs::write(&report, "<testsuite>").unwrap();
+        let request = LogExecutionRequest {
+            cwd: workspace.path().to_path_buf(),
+            source: LogExecutionSource::File {
+                path: report,
+                kind: LogInputKind::JunitXml,
+            },
+        };
+        let request_path = persist_execution_request(workspace.path(), &request).unwrap();
+
+        let projection = execute_log_request(&request_path).unwrap();
+
+        assert!(projection.contains("normalization_failed"));
+        assert!(!projection.contains("\"status\":\"passed\""));
+    }
+
+    #[test]
+    fn log_executor_rejects_files_outside_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let request = LogExecutionRequest {
+            cwd: workspace.path().to_path_buf(),
+            source: LogExecutionSource::File {
+                path: outside.path().to_path_buf(),
+                kind: LogInputKind::GenericText,
+            },
+        };
+        let request_path = persist_execution_request(workspace.path(), &request).unwrap();
+
+        assert!(matches!(
+            execute_log_request(&request_path),
+            Err(HookError::InvalidInput(
+                "report path is outside the workspace"
+            ))
+        ));
+    }
+
+    #[test]
+    fn recognizes_simple_nextest_without_shell_composition() {
+        let request = parse_simple_log_command(
+            "cargo +nightly nextest run -p cabal-runtime-hook",
+            Path::new("."),
+        )
+        .unwrap();
+
+        assert_eq!(
+            request.source,
+            LogExecutionSource::Nextest {
+                cargo_args: vec![
+                    "+nightly".to_owned(),
+                    "nextest".to_owned(),
+                    "run".to_owned(),
+                    "-p".to_owned(),
+                    "cabal-runtime-hook".to_owned(),
+                ]
+            }
+        );
     }
 }

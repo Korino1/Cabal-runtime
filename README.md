@@ -1,36 +1,43 @@
 # Cabal Runtime
 
-Cabal Runtime moves deterministic repository mechanics out of a model's working context. Models receive the semantic result needed for a decision instead of raw compiler logs, test output, unified diffs, hashes, artifact paths, or runtime bookkeeping.
+Cabal Runtime moves deterministic repository mechanics out of a model's working context. Models receive the bounded semantic result needed for a decision instead of raw compiler output, test logs, report noise, hashes, artifact paths, or runtime bookkeeping.
 
 ## Native Codex Integration
 
-The bundled `cabal-runtime` plugin uses the standard Codex `PreToolUse` hook. It transparently rewrites simple `cargo build`, `cargo check`, `cargo clippy`, and `cargo test` Bash calls before execution.
+The bundled `cabal-runtime` plugin uses the standard Codex `PreToolUse` hook. It transparently rewrites only recognized simple Bash tool calls before execution. The model does not call a Cabal tool, load a Cabal skill, or perform an extra workflow step.
 
 The native Rust gateway:
 
-- runs Cargo directly without a shell;
-- stores complete stdout and stderr under ignored `.cabal/artifacts/`;
-- returns a bounded JSON projection containing verdicts and actionable diagnostics;
-- preserves compiler error codes, locations, and test failure summaries;
-- removes progress noise, raw source excerpts, hashes, artifact paths, and Cabal bookkeeping from the model-facing result.
+- executes recognized commands directly without a shell;
+- stores complete stdout, stderr, and report bytes under ignored `.cabal/artifacts/`;
+- returns a bounded JSON projection with verdicts, counts, actionable diagnostics, and source locations;
+- excludes progress noise, captured output, hashes, artifact paths, and Cabal bookkeeping from the model-facing result;
+- leaves unrecognized or composed shell commands unchanged.
 
-This integration runs in the standard Codex CLI without a fork. It adds no MCP tools and no skill prompt surface, so operation does not consume model instructions or require model actions.
+This runs in the standard Codex CLI without a fork. Transparency applies to the supported hook paths listed below; Cabal does not claim interception of every possible Codex tool or shell expression.
 
-## Components
+## Implemented Modules
 
-### `cabal-runtime-hook`
+### Cargo Gateway
 
-Native Codex hook runtime and Cargo context gateway.
+Simple `cargo build`, `cargo check`, `cargo clippy`, and `cargo test` calls are redirected to the native gateway. Compiler and test output is normalized while error codes, locations, verdicts, and failure summaries are retained.
 
-### `cabal-observe`
+### Artifact and Log Gateway
 
-Normalizes saved Cargo/rustc JSON and textual test output into `ObservationPack` JSON. Raw input is persisted locally by SHA-256 identity.
+Simple report reads are redirected when their file name identifies a supported format:
 
-### `cabal-delta`
+- `Get-Content report.junit.xml` or `cat report.junit.xml`: JUnit XML;
+- `Get-Content report.sarif` or `cat report.sarif.json`: SARIF 2.1.0;
+- `Get-Content report.nextest.log` or `cat report.nextest.log`: nextest text;
+- `Get-Content report.log` or `cat report.log`: bounded generic diagnostics.
 
-Normalizes an already captured unified Git diff into `DeltaPack` JSON, preserving file status, paths, hunk ranges, change counts, rename markers, and binary markers.
+Simple `cargo nextest run ...` calls are also recognized. JUnit `system-out`/`system-err`, repetitive log lines, and non-actionable report structure remain in the local raw artifact. The projection preserves suite/test identity, pass/fail/skip/error counts, rule IDs, messages, primary locations, and related SARIF locations. Malformed structured input produces `normalization_failed`; it never produces a false success verdict.
 
-Each component is an independent Rust crate.
+### Supporting Normalizers
+
+- `cabal-observe` normalizes Cargo/rustc JSON and textual test output.
+- `cabal-delta` normalizes an already captured unified Git diff.
+- `cabal-log` independently normalizes JUnit XML, SARIF 2.1.0, nextest text, and generic logs.
 
 ## Requirements
 
@@ -49,18 +56,17 @@ codex plugin marketplace add .
 codex plugin add cabal-runtime@cabal-runtime-local
 ```
 
-Review and trust the installed hook through `/hooks` before ordinary Codex use. The `--dangerously-bypass-hook-trust` flag is only for controlled validation.
+Review and trust the installed hook through `/hooks` before ordinary Codex use. The `--dangerously-bypass-hook-trust` flag is reserved for controlled validation and is not required for normal operation after trust is recorded.
 
 ## Validate
 
 ```powershell
 cargo +nightly fmt --all -- --check
-cargo +nightly test --workspace
+cargo +nightly test --workspace --all-targets
 cargo +nightly clippy --workspace --all-targets -- -D warnings
-cargo +nightly check --workspace --all-targets --target x86_64-unknown-linux-gnu
 ```
 
-The native gateway has been exercised in standard Codex CLI on Windows for successful checks, compiler failures, and test suites. The workspace also cross-compiles for `x86_64-unknown-linux-gnu`.
+CI runs the test suite on Windows and Linux. A regression test verifies that a noisy JUnit report is reduced by more than 10x while its actionable failure evidence remains available to the model.
 
 ## License
 
@@ -68,10 +74,12 @@ Dual-licensed under MIT or Apache-2.0.
 
 ## Описание на русском
 
-Cabal Runtime переносит детерминированную техническую обработку за пределы рабочего контекста модели. Вместо сырых логов компиляции и тестов, полного Git diff, хешей, путей артефактов и служебных записей модель получает только краткий семантический результат, необходимый для следующего решения.
+Cabal Runtime переносит детерминированную техническую обработку за пределы рабочего контекста модели. Вместо сырых логов компиляции и тестов, шума отчётов, хешей, путей артефактов и внутренних записей модель получает ограниченный семантический результат, необходимый для следующего решения.
 
-Плагин `cabal-runtime` нативно использует стандартный hook `PreToolUse` в Codex CLI. Простые вызовы `cargo build`, `cargo check`, `cargo clippy` и `cargo test` незаметно перенаправляются в Rust gateway до выполнения. Gateway запускает Cargo без shell, сохраняет полный stdout и stderr локально в игнорируемом каталоге `.cabal/artifacts/`, а модели возвращает ограниченную JSON-проекцию.
+Плагин `cabal-runtime` использует штатный hook `PreToolUse` стандартного Codex CLI. До выполнения он незаметно перенаправляет только распознанные простые вызовы Bash. Модель не вызывает инструмент Cabal, не загружает skill Cabal и не выполняет дополнительных шагов. Fork Codex не используется.
 
-В контексте модели сохраняются итог операции, коды ошибок компилятора, важные диагностики, позиции в исходниках и сводка падений тестов. Progress-строки, сырые фрагменты исходников, хеши, пути артефактов и внутренние записи Cabal в контекст модели не передаются.
+Реализованный Cargo Gateway обрабатывает простые команды `cargo build`, `cargo check`, `cargo clippy` и `cargo test`. Полные stdout и stderr сохраняются локально в игнорируемом каталоге `.cabal/artifacts/`, а в контекст модели возвращаются итог, коды ошибок, важные диагностики, координаты в исходниках и сводка тестов.
 
-Интеграция работает в стандартном Codex CLI без fork. Она не добавляет MCP-инструменты и не использует skill-инструкции, поэтому модели не требуется знать о работе плагина или выполнять дополнительные действия.
+Реализованный Artifact and Log Gateway перехватывает простое чтение файлов `*.junit.xml`, `*.sarif`, `*.sarif.json`, `*.nextest.log` и `*.log`, а также простые вызовы `cargo nextest run`. Он поддерживает JUnit XML, SARIF 2.1.0, текст nextest и ограниченную обработку обычных логов. В контексте сохраняются идентификаторы suite/test, счётчики pass/fail/skip/error, rule ID, сообщения и координаты. `system-out`, `system-err`, повторяющиеся строки и служебная структура остаются только в локальном сыром артефакте. Повреждённый структурированный отчёт получает статус `normalization_failed` и не может быть объявлен успешным.
+
+Прозрачность действует для перечисленных поддерживаемых путей hook API. Неизвестные и составные shell-команды не изменяются; проект не заявляет перехват всех возможных инструментов Codex. Каждый нормализатор является отдельным Rust-модулем, поэтому модули выполняют свои задачи независимо и объединяются только в границе нативного gateway.

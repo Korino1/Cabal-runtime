@@ -1,0 +1,1 @@
+<testsuites><testsuite name="unit"><testcase name="ok"/><testcase name="skip"><skipped/></testcase></testsuite><testsuite name="integration"><testcase name="broken"><failure message="assertion failed" file="src/lib.rs" line="42" column="7"/></testcase><testcase name="bad"><error message="setup error"/></testcase></testsuite></testsuites>

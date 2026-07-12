@@ -1,0 +1,6 @@
+Starting 3 tests across 1 binary
+PASS [   0.001s] crate::alpha
+SKIP [         ] crate::beta
+PASS [   0.002s] crate::gamma
+------------
+Summary [   0.010s] 3 tests run: 2 passed, 0 failed, 1 skipped

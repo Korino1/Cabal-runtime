@@ -1,7 +1,7 @@
 {
   "name": "cabal-runtime",
-  "version": "0.2.0",
-  "description": "Native pre-execution projection for supported Cargo validation commands.",
+  "version": "0.3.0+codex.local-20260712-133555",
+  "description": "Native pre-execution projection for supported Cargo commands and structured logs.",
   "author": {
     "name": "Korino1",
     "email": "necroticus1@gmail.com",
@@ -9,6 +9,5 @@
   },
   "repository": "https://github.com/Korino1/Cabal-runtime",
   "license": "MIT OR Apache-2.0",
-  "keywords": ["codex", "context", "runtime"],
-  "hooks": "./hooks/hooks.json"
+  "keywords": ["codex", "context", "runtime"]
 }
