@@ -80,6 +80,38 @@ Example contract:
 }
 ```
 
+### Change Policy Guard
+
+The opt-in Change Policy Guard evaluates intercepted `apply_patch` calls and bounded simple Bash commands through the standard `PreToolUse` hook before the tool can mutate the workspace. Its fixed policy location is `.cabal/policy/change_policy.json`. Without that file, the module emits no decision and changes no existing gateway behavior.
+
+For `apply_patch`, the guard validates every add, update, delete, and move path; workspace containment and existing symlink ancestors; allow/deny, internal, and generated path classes; patch byte size; distinct file count; and changed-line count. For Bash, it matches exact bounded argument arrays and built-in destructive forms. Unsupported shell composition or quoting receives no policy decision and remains under normal Codex behavior. The evaluator never executes a command or applies a patch.
+
+Allowed requests produce no policy output, preserving Codex's normal permission flow. Denied requests use the native `permissionDecision: "deny"` wire and expose only one bounded decision code. Policy and input digests, timestamps, locks, receipts, commands, patches, and paths remain local under ignored `.cabal/` state and do not enter model context. A policy action of `ask` is conservatively mapped to `deny` because the current standard Codex `PreToolUse` API reports `ask` as unsupported and otherwise continues the original call.
+
+Example policy:
+
+```json
+{
+  "version": 1,
+  "paths": {
+    "allow": ["src/**", "tests/**", "README.md"],
+    "deny": ["secrets/**"],
+    "internal": [".cabal/**", ".codex/**", ".memoryx/**"],
+    "generated": ["target/**", "dist/**"]
+  },
+  "rules": { "internal": "deny", "generated": "deny" },
+  "limits": { "max_patch_bytes": 65536, "max_files": 32, "max_line_changes": 2000 },
+  "commands": {
+    "allow": [["cargo", "test"]],
+    "ask": [["cargo", "fmt"]],
+    "deny": [["git", "reset", "--hard"]],
+    "destructive": [["rm", "-rf", "target"]]
+  }
+}
+```
+
+This is a guardrail over the exact tool paths intercepted by the current Codex hook API, not a claim of universal mutation interception. Equivalent actions through unsupported tools, incomplete `unified_exec` interception, MCP tools, or unrecognized shell forms remain outside this module's enforcement boundary.
+
 ### Supporting Normalizers
 
 - `cabal-observe` normalizes Cargo/rustc JSON and textual test output.
@@ -119,6 +151,8 @@ File-cache regression tests cover repeated and newly requested ranges, BOM and U
 
 Completion-gate tests cover silent pass, bounded block, malformed contracts, missing/failed/stale receipts, failed-run invalidation, file predicates, same-size replacement, workspace containment, Unicode, symlinks, directory cycles, concurrency, deterministic ordering, recursion, prompt-injection resistance, and native Cargo receipt integration.
 
+Change-policy tests cover inert and silent paths, add/update/delete/move parsing, malformed patches, path classes, size limits, quoting, shell composition, traversal, Windows and Linux path forms, symlink escape, receipt containment and concurrency, bounded deny output, and preservation of existing gateway rewrites.
+
 ## License
 
 Dual-licensed under MIT or Apache-2.0.
@@ -140,6 +174,16 @@ Gateway распознаёт четыре точные ограниченные 
 Поддерживаются точные receipts успешных Cargo-команд с объявленными входными путями, существование обычного файла, отсутствие пути и точный SHA-256 файла. Нативный Cargo gateway автоматически записывает совпавший успешный receipt и инвалидирует прежний receipt перед каждым повторным запуском. Байты контракта и объявленных входов хешируются заново, поэтому изменённые исходники, замена того же размера, восстановленное время, другой checkout или изменение контракта не могут повторно использовать устаревший успех.
 
 Проверка, receipts, хеши, блокировки, пути и диагностические подробности не попадают в контекст модели. Успешный путь невидим модели. При блокировке сам факт продолжения и краткая причина неизбежно видимы модели в рамках API `Stop`. Модуль не извлекает критерии из текста ответа модели и не читает нестабильный transcript. Автоматические command receipts пока создаются только для Cargo-команд нативного gateway Cabal.
+
+### Контроль политики изменений
+
+Опциональный Change Policy Guard проверяет перехваченные вызовы `apply_patch` и ограниченные простые Bash-команды через штатный hook `PreToolUse` до возможного изменения файлов. Policy хранится в `.cabal/policy/change_policy.json`. Если файла нет, модуль ничего не выводит и не влияет на работу остальных gateway.
+
+Для `apply_patch` проверяются все пути добавления, изменения, удаления и переноса, нахождение внутри workspace, существующие symlink-предки, allow/deny-классы, внутренние и generated-файлы, размер patch, число файлов и число изменяемых строк. Для Bash policy сопоставляет точные ограниченные массивы аргументов и встроенные destructive-формы. Неподдерживаемая shell-композиция или quoting не получает решения policy и остаётся под штатным контролем Codex. Evaluator не запускает команду и не применяет patch.
+
+Разрешённый запрос не создаёт model-visible вывода и сохраняет штатную permission-схему Codex. Запрещённый запрос возвращает нативный `permissionDecision: "deny"` только с коротким безопасным кодом. Policy, хеши входов, timestamps, locks, receipts, команды, patch и пути остаются в игнорируемом состоянии `.cabal/` и не попадают в контекст модели. Действие policy `ask` преобразуется в `deny`, поскольку текущий API стандартного Codex помечает `PreToolUse ask` как неподдерживаемый и иначе продолжает исходный вызов.
+
+Это guardrail только для точных путей инструментов, которые перехватывает текущий hook API. Модуль не заявляет универсальный контроль действий через неподдерживаемые инструменты, неполный перехват `unified_exec`, MCP или нераспознанные shell-формы.
 
 Cabal Runtime переносит детерминированную техническую обработку за пределы рабочего контекста модели. Вместо сырых логов компиляции и тестов, шума отчётов, хешей, путей артефактов и внутренних записей модель получает ограниченный семантический результат, необходимый для следующего решения.
 

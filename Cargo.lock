@@ -18,6 +18,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cabal-change-policy"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "cabal-completion-gate"
 version = "0.1.0"
 dependencies = [
@@ -74,8 +85,9 @@ dependencies = [
 
 [[package]]
 name = "cabal-runtime-hook"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
+ "cabal-change-policy",
  "cabal-completion-gate",
  "cabal-delta",
  "cabal-file-cache",

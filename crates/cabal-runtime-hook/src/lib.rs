@@ -10,6 +10,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use cabal_change_policy::{
+    Decision as ChangeDecision, PolicyState as ChangePolicyState, ToolInput as ChangeToolInput,
+    evaluate as evaluate_change, receipt_for as change_receipt_for,
+    write_receipt as write_change_receipt,
+};
 use cabal_completion_gate::{
     CargoCommand as CompletionCargoCommand, CargoOutcome, GateError, GateStatus,
     evaluate as evaluate_completion, record_cargo_outcome,
@@ -95,13 +100,58 @@ struct PreToolUseSpecificOutput {
     hook_event_name: &'static str,
     #[serde(rename = "permissionDecision")]
     permission_decision: &'static str,
-    #[serde(rename = "updatedInput")]
-    updated_input: UpdatedBashInput,
+    #[serde(
+        rename = "permissionDecisionReason",
+        skip_serializing_if = "Option::is_none"
+    )]
+    permission_decision_reason: Option<String>,
+    #[serde(rename = "updatedInput", skip_serializing_if = "Option::is_none")]
+    updated_input: Option<UpdatedToolInput>,
 }
 
 #[derive(Debug, Serialize)]
-struct UpdatedBashInput {
+struct UpdatedToolInput {
     command: String,
+}
+
+impl PreToolUseOutput {
+    fn rewrite(command: String) -> Self {
+        Self {
+            hook_specific_output: PreToolUseSpecificOutput {
+                hook_event_name: "PreToolUse",
+                permission_decision: "allow",
+                permission_decision_reason: None,
+                updated_input: Some(UpdatedToolInput { command }),
+            },
+        }
+    }
+
+    fn deny(code: &str) -> Self {
+        Self {
+            hook_specific_output: PreToolUseSpecificOutput {
+                hook_event_name: "PreToolUse",
+                permission_decision: "deny",
+                permission_decision_reason: Some(format!(
+                    "Change blocked by policy: {}.",
+                    safe_policy_code(code)
+                )),
+                updated_input: None,
+            },
+        }
+    }
+}
+
+fn safe_policy_code(code: &str) -> &str {
+    if !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        code
+    } else {
+        "policy_denied"
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -406,7 +456,7 @@ pub fn prepare_pre_tool_use(
     input: PreToolUseInput,
     executable: &Path,
 ) -> Result<Option<PreToolUseOutput>, HookError> {
-    if input.hook_event_name != "PreToolUse" || input.tool_name != "Bash" {
+    if input.hook_event_name != "PreToolUse" {
         return Ok(None);
     }
 
@@ -414,7 +464,15 @@ pub fn prepare_pre_tool_use(
         .tool_input
         .get("command")
         .and_then(Value::as_str)
-        .ok_or(HookError::InvalidInput("Bash command is missing"))?;
+        .ok_or(HookError::InvalidInput("tool command is missing"))?;
+
+    if let Some(output) = evaluate_change_policy(&input, command) {
+        return Ok(Some(output));
+    }
+    if input.tool_name != "Bash" {
+        return Ok(None);
+    }
+
     let rewritten_command = if let Some(request) = parse_simple_cargo_command(command, &input.cwd) {
         let request_path = persist_execution_request(&input.cwd, &request)?;
         build_executor_command(executable, "execute-cargo", &request_path)
@@ -433,15 +491,31 @@ pub fn prepare_pre_tool_use(
         return Ok(None);
     };
 
-    Ok(Some(PreToolUseOutput {
-        hook_specific_output: PreToolUseSpecificOutput {
-            hook_event_name: "PreToolUse",
-            permission_decision: "allow",
-            updated_input: UpdatedBashInput {
-                command: rewritten_command,
-            },
-        },
-    }))
+    Ok(Some(PreToolUseOutput::rewrite(rewritten_command)))
+}
+
+fn evaluate_change_policy(input: &PreToolUseInput, command: &str) -> Option<PreToolUseOutput> {
+    let policy_input = match input.tool_name.as_str() {
+        "Bash" => ChangeToolInput::Bash(command),
+        "apply_patch" => ChangeToolInput::ApplyPatch(command),
+        _ => return None,
+    };
+    let evaluation = evaluate_change(&input.cwd, policy_input.clone());
+    if evaluation.state == ChangePolicyState::Disabled {
+        return None;
+    }
+
+    if let Some(receipt) = change_receipt_for(&evaluation, policy_input)
+        && write_change_receipt(&input.cwd, &receipt).is_err()
+    {
+        return Some(PreToolUseOutput::deny("receipt_unavailable"));
+    }
+
+    match evaluation.decision {
+        Some(ChangeDecision::Allow) | None => None,
+        Some(ChangeDecision::Ask) => Some(PreToolUseOutput::deny("approval_required")),
+        Some(ChangeDecision::Deny) => Some(PreToolUseOutput::deny(&evaluation.code)),
+    }
 }
 
 /// Executes one bounded UTF-8 file observation without a shell.
@@ -2282,6 +2356,159 @@ mod tests {
 
         assert!(serialized.contains("execute-file-read"));
         assert!(!serialized.contains("cat notes.txt"));
+    }
+
+    #[test]
+    fn change_policy_is_inert_when_absent_and_silent_when_allowed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let patch =
+            "*** Begin Patch\n*** Add File: src/lib.rs\n+pub fn value() {}\n*** End Patch\n";
+        let input = PreToolUseInput {
+            hook_event_name: "PreToolUse".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            tool_name: "apply_patch".to_owned(),
+            tool_input: serde_json::json!({"command": patch}),
+            session_id: None,
+        };
+        assert!(
+            prepare_pre_tool_use(input, Path::new("/opt/cabal-runtime-hook"))
+                .unwrap()
+                .is_none()
+        );
+
+        write_change_policy(
+            workspace.path(),
+            serde_json::json!({
+                "version": 1,
+                "paths": {"allow": ["src/**"]}
+            }),
+        );
+        let input = PreToolUseInput {
+            hook_event_name: "PreToolUse".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            tool_name: "apply_patch".to_owned(),
+            tool_input: serde_json::json!({"command": patch}),
+            session_id: None,
+        };
+        assert!(
+            prepare_pre_tool_use(input, Path::new("/opt/cabal-runtime-hook"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            workspace
+                .path()
+                .join(".cabal/state/change_policy/receipts")
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn change_policy_denies_before_patch_and_exposes_only_safe_code() {
+        let workspace = tempfile::tempdir().unwrap();
+        write_change_policy(
+            workspace.path(),
+            serde_json::json!({
+                "version": 1,
+                "paths": {"deny": ["secrets/**"]}
+            }),
+        );
+        let patch = "*** Begin Patch\n*** Add File: secrets/key\n+raw-secret\n*** End Patch\n";
+        let input = PreToolUseInput {
+            hook_event_name: "PreToolUse".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            tool_name: "apply_patch".to_owned(),
+            tool_input: serde_json::json!({"command": patch}),
+            session_id: None,
+        };
+        let output = prepare_pre_tool_use(input, Path::new("/opt/cabal-runtime-hook"))
+            .unwrap()
+            .unwrap();
+        let wire = serde_json::to_value(output).unwrap();
+        let specific = &wire["hookSpecificOutput"];
+        assert_eq!(specific["permissionDecision"], "deny");
+        assert_eq!(
+            specific["permissionDecisionReason"],
+            "Change blocked by policy: path_denied."
+        );
+        assert!(specific.get("updatedInput").is_none());
+        let encoded = serde_json::to_string(&wire).unwrap();
+        assert!(!encoded.contains("secrets/key"));
+        assert!(!encoded.contains("raw-secret"));
+        assert!(!workspace.path().join("secrets/key").exists());
+    }
+
+    #[test]
+    fn change_policy_maps_ask_to_deny_and_malformed_policy_fails_closed() {
+        let workspace = tempfile::tempdir().unwrap();
+        write_change_policy(
+            workspace.path(),
+            serde_json::json!({
+                "version": 1,
+                "commands": {"ask": [["cargo", "fmt"]]}
+            }),
+        );
+        let input = pre_tool_bash(workspace.path(), "cargo fmt");
+        let wire = serde_json::to_value(
+            prepare_pre_tool_use(input, Path::new("/opt/cabal-runtime-hook"))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            wire["hookSpecificOutput"]["permissionDecisionReason"],
+            "Change blocked by policy: approval_required."
+        );
+
+        fs::write(
+            workspace
+                .path()
+                .join(cabal_change_policy::POLICY_RELATIVE_PATH),
+            b"not json",
+        )
+        .unwrap();
+        let input = pre_tool_bash(workspace.path(), "git reset --hard");
+        let wire = serde_json::to_value(
+            prepare_pre_tool_use(input, Path::new("/opt/cabal-runtime-hook"))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            wire["hookSpecificOutput"]["permissionDecisionReason"],
+            "Change blocked by policy: invalid_policy."
+        );
+
+        let input = pre_tool_bash(workspace.path(), "cargo test");
+        let wire = serde_json::to_value(
+            prepare_pre_tool_use(input, Path::new("/opt/cabal-runtime-hook"))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wire["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert!(
+            wire["hookSpecificOutput"]["updatedInput"]["command"]
+                .as_str()
+                .unwrap()
+                .contains("execute-cargo")
+        );
+    }
+
+    fn write_change_policy(workspace: &Path, policy: serde_json::Value) {
+        let path = workspace.join(cabal_change_policy::POLICY_RELATIVE_PATH);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, serde_json::to_vec(&policy).unwrap()).unwrap();
+    }
+
+    fn pre_tool_bash(workspace: &Path, command: &str) -> PreToolUseInput {
+        PreToolUseInput {
+            hook_event_name: "PreToolUse".to_owned(),
+            cwd: workspace.to_path_buf(),
+            tool_name: "Bash".to_owned(),
+            tool_input: serde_json::json!({"command": command}),
+            session_id: None,
+        }
     }
 
     fn execute_file_read(

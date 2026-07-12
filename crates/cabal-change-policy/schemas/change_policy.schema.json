@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Cabal Change Policy",
+  "type": "object",
+  "required": ["version"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": 1 },
+    "paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allow": { "$ref": "#/$defs/patterns" },
+        "deny": { "$ref": "#/$defs/patterns" },
+        "internal": { "$ref": "#/$defs/patterns" },
+        "generated": { "$ref": "#/$defs/patterns" }
+      }
+    },
+    "rules": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "internal": { "$ref": "#/$defs/action" },
+        "generated": { "$ref": "#/$defs/action" }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_patch_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+        "max_files": { "type": "integer", "minimum": 1, "maximum": 256 },
+        "max_line_changes": { "type": "integer", "minimum": 1, "maximum": 200000 }
+      }
+    },
+    "commands": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allow": { "$ref": "#/$defs/command_sets" },
+        "ask": { "$ref": "#/$defs/command_sets" },
+        "deny": { "$ref": "#/$defs/command_sets" },
+        "destructive": { "$ref": "#/$defs/command_sets" }
+      }
+    }
+  },
+  "$defs": {
+    "action": { "enum": ["allow", "ask", "deny"] },
+    "patterns": { "type": "array", "maxItems": 64, "items": { "type": "string", "minLength": 1, "maxLength": 512 } },
+    "command_sets": { "type": "array", "maxItems": 64, "items": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "type": "string", "minLength": 1, "maxLength": 256 } } }
+  }
+}
