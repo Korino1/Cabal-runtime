@@ -54,6 +54,32 @@ Observations are scoped to the Codex session and invalidated by the standard `Se
 
 Full-file reads are limited to 256 KiB. Line reads are limited to 400 lines and 64 KiB, paths to 4096 bytes, and changed ranges to 64 entries. Binary data, invalid UTF-8, files outside the workspace, oversized requests, flags, wildcards, and composed shell expressions are left untouched for normal Codex execution.
 
+### Completion Gate
+
+The opt-in Completion Gate evaluates a local versioned `.cabal/completion/contract.json` through the standard Codex `Stop` hook. An absent contract never blocks completion. A satisfied contract returns only the API-required pass JSON and creates no model-facing continuation. When deterministic evidence is missing, stale, failed, malformed, or unavailable, Codex receives one bounded continuation prompt containing only safe criterion IDs or a generic contract status. `stop_hook_active` prevents an infinite continuation loop.
+
+Supported criteria are exact successful Cargo command receipts with declared workspace input paths, regular-file existence, path absence, and exact file SHA-256. The native Cargo gateway automatically records successful matching receipts and invalidates an older receipt before every matching rerun. Contract bytes and declared input bytes are rehashed, so changed inputs, same-size replacement, restored timestamps, another checkout, or a changed contract cannot reuse stale success.
+
+Contract evaluation, receipt files, hashes, locks, paths, and diagnostic details remain outside model context. The successful path is invisible to the model. On the blocked path, the continuation itself and its concise reason are necessarily model-visible under the supported Codex `Stop` API. This module does not infer acceptance criteria from assistant prose and does not inspect the unstable transcript format. Automatic command receipts currently cover only Cargo commands routed through Cabal's native gateway.
+
+Example contract:
+
+```json
+{
+  "version": 1,
+  "criteria": [
+    {
+      "id": "workspace-tests",
+      "type": "command_receipt",
+      "program": "cargo",
+      "args": ["test", "--workspace"],
+      "input_paths": ["Cargo.toml", "src", "tests"]
+    },
+    { "id": "release-notes", "type": "file_exists", "path": "README.md" }
+  ]
+}
+```
+
 ### Supporting Normalizers
 
 - `cabal-observe` normalizes Cargo/rustc JSON and textual test output.
@@ -91,6 +117,8 @@ CI runs the test suite on Windows and Linux. Regression tests verify JUnit conte
 
 File-cache regression tests cover repeated and newly requested ranges, BOM and Unicode, CRLF and missing final newlines, same-metadata rewrites, rapid changes, concurrent readers, session changes, compact invalidation, rename/delete behavior, path containment, invalid UTF-8, and size limits.
 
+Completion-gate tests cover silent pass, bounded block, malformed contracts, missing/failed/stale receipts, failed-run invalidation, file predicates, same-size replacement, workspace containment, Unicode, symlinks, directory cycles, concurrency, deterministic ordering, recursion, prompt-injection resistance, and native Cargo receipt integration.
+
 ## License
 
 Dual-licensed under MIT or Apache-2.0.
@@ -104,6 +132,14 @@ Gateway распознаёт четыре точные ограниченные 
 Наблюдения изолированы по сессии Codex и сбрасываются штатными hooks `SessionStart` и `PostCompact`. При каждом перехваченном чтении Cabal заново хеширует байты, поэтому замена файла с тем же размером и восстановленным временем изменения не создаёт ложный результат `unchanged`. Хеши, пути снимков, блокировки и служебное состояние не передаются модели.
 
 Полное чтение ограничено 256 КиБ. Диапазон ограничен 400 строками и 64 КиБ, путь — 4096 байтами, список изменений — 64 элементами. Бинарные данные, невалидный UTF-8, файлы вне рабочей области, превышение лимитов, флаги, wildcard и составные shell-выражения плагин не перехватывает: их штатно исполняет Codex.
+
+### Контроль завершения
+
+Опциональный Completion Gate проверяет локальный версионированный `.cabal/completion/contract.json` через штатный hook `Stop`. Отсутствие контракта никогда не блокирует завершение. Выполненный контракт возвращает только обязательный для API pass JSON и не создаёт видимого модели продолжения. Если детерминированное доказательство отсутствует, устарело, завершилось ошибкой, контракт повреждён или проверка недоступна, Codex получает один ограниченный continuation prompt только с безопасными ID критериев либо общим статусом контракта. `stop_hook_active` предотвращает бесконечный цикл продолжений.
+
+Поддерживаются точные receipts успешных Cargo-команд с объявленными входными путями, существование обычного файла, отсутствие пути и точный SHA-256 файла. Нативный Cargo gateway автоматически записывает совпавший успешный receipt и инвалидирует прежний receipt перед каждым повторным запуском. Байты контракта и объявленных входов хешируются заново, поэтому изменённые исходники, замена того же размера, восстановленное время, другой checkout или изменение контракта не могут повторно использовать устаревший успех.
+
+Проверка, receipts, хеши, блокировки, пути и диагностические подробности не попадают в контекст модели. Успешный путь невидим модели. При блокировке сам факт продолжения и краткая причина неизбежно видимы модели в рамках API `Stop`. Модуль не извлекает критерии из текста ответа модели и не читает нестабильный transcript. Автоматические command receipts пока создаются только для Cargo-команд нативного gateway Cabal.
 
 Cabal Runtime переносит детерминированную техническую обработку за пределы рабочего контекста модели. Вместо сырых логов компиляции и тестов, шума отчётов, хешей, путей артефактов и внутренних записей модель получает ограниченный семантический результат, необходимый для следующего решения.
 

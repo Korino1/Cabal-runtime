@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use cabal_completion_gate::{
+    CargoCommand as CompletionCargoCommand, CargoOutcome, GateError, GateStatus,
+    evaluate as evaluate_completion, record_cargo_outcome,
+};
 use cabal_delta::{
     DeltaPack, GitStatusPack, StatusKind, normalize_bytes as normalize_diff, normalize_status_bytes,
 };
@@ -44,6 +48,41 @@ pub struct PreToolUseInput {
     pub session_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct StopInput {
+    pub hook_event_name: String,
+    pub cwd: PathBuf,
+    pub stop_hook_active: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StopOutput {
+    #[serde(rename = "continue", skip_serializing_if = "Option::is_none")]
+    should_continue: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+impl StopOutput {
+    fn pass() -> Self {
+        Self {
+            should_continue: Some(true),
+            decision: None,
+            reason: None,
+        }
+    }
+
+    fn block(reason: String) -> Self {
+        Self {
+            should_continue: None,
+            decision: Some("block"),
+            reason: Some(reason),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct PreToolUseOutput {
     #[serde(rename = "hookSpecificOutput")]
@@ -69,6 +108,7 @@ struct UpdatedBashInput {
 struct CargoExecutionRequest {
     cwd: PathBuf,
     cargo_args: Vec<String>,
+    receipt_args: Vec<String>,
     kind: CargoExecutionKind,
 }
 
@@ -576,12 +616,35 @@ pub fn execute_log_request(request_path: &Path) -> Result<String, HookError> {
 pub fn execute_cargo_request(request_path: &Path) -> Result<String, HookError> {
     let request = serde_json::from_slice::<CargoExecutionRequest>(&fs::read(request_path)?)?;
     let artifact_root = artifact_root_for(&request.cwd);
+    let completion_command = CompletionCargoCommand::new(request.receipt_args.clone());
+    let contract_path = completion_contract_path(&request.cwd);
+    let completion_state = completion_state_root(&request.cwd);
+
+    // An attempted rerun invalidates an older success before process launch.
+    update_completion_outcome(
+        &contract_path,
+        &request.cwd,
+        &completion_state,
+        &completion_command,
+        CargoOutcome::Failed,
+    )?;
 
     let output = Command::new("cargo")
         .args(&request.cargo_args)
         .current_dir(&request.cwd)
         .stdin(Stdio::null())
         .output()?;
+    update_completion_outcome(
+        &contract_path,
+        &request.cwd,
+        &completion_state,
+        &completion_command,
+        if output.status.success() {
+            CargoOutcome::Succeeded
+        } else {
+            CargoOutcome::Failed
+        },
+    )?;
 
     let mut complete_raw = output.stdout.clone();
     if !output.stderr.is_empty() {
@@ -648,10 +711,11 @@ fn parse_simple_cargo_command(command: &str, cwd: &Path) -> Option<CargoExecutio
         _ => return None,
     };
 
-    let mut cargo_args = words[1..]
+    let receipt_args = words[1..]
         .iter()
         .map(|word| (*word).to_owned())
         .collect::<Vec<_>>();
+    let mut cargo_args = receipt_args.clone();
     if kind == CargoExecutionKind::BuildJson
         && !cargo_args
             .iter()
@@ -667,8 +731,55 @@ fn parse_simple_cargo_command(command: &str, cwd: &Path) -> Option<CargoExecutio
     Some(CargoExecutionRequest {
         cwd: cwd.to_path_buf(),
         cargo_args,
+        receipt_args,
         kind,
     })
+}
+
+/// Evaluates an opt-in deterministic completion contract for a Codex Stop event.
+pub fn evaluate_stop(input: StopInput) -> StopOutput {
+    if input.hook_event_name != "Stop" {
+        return stop_wire_failure();
+    }
+    if input.stop_hook_active {
+        return StopOutput::pass();
+    }
+    let evaluation = evaluate_completion(
+        &completion_contract_path(&input.cwd),
+        &input.cwd,
+        &completion_state_root(&input.cwd),
+    );
+    let reason = match evaluation.status {
+        GateStatus::Pass => return StopOutput::pass(),
+        GateStatus::Block => format!(
+            "Completion evidence missing: {}.",
+            evaluation.missing_ids.join(",")
+        ),
+        GateStatus::InvalidContract => {
+            "Completion evidence unavailable: invalid_contract.".to_owned()
+        }
+        GateStatus::EvidenceUnavailable => {
+            "Completion evidence unavailable: local_check_failed.".to_owned()
+        }
+    };
+    StopOutput::block(reason)
+}
+
+pub fn stop_wire_failure() -> StopOutput {
+    StopOutput::block("Completion evidence unavailable: invalid_hook_input.".to_owned())
+}
+
+fn update_completion_outcome(
+    contract_path: &Path,
+    workspace: &Path,
+    state_root: &Path,
+    command: &CompletionCargoCommand,
+    outcome: CargoOutcome,
+) -> Result<(), HookError> {
+    match record_cargo_outcome(contract_path, workspace, state_root, command, outcome) {
+        Ok(()) | Err(GateError::NoMatchingCriterion) => Ok(()),
+        Err(_) => Err(HookError::InvalidInput("completion evidence update failed")),
+    }
 }
 
 fn parse_simple_log_command(command: &str, cwd: &Path) -> Option<LogExecutionRequest> {
@@ -901,28 +1012,34 @@ fn persist_request_at(root: &Path, request: &impl Serialize) -> Result<PathBuf, 
 }
 
 fn git_runtime_root(cwd: &Path) -> PathBuf {
-    for directory in cwd.ancestors() {
-        let dot_git = directory.join(".git");
-        if dot_git.is_dir() {
-            return dot_git.join("cabal-runtime");
-        }
-        if let Ok(pointer) = fs::read_to_string(&dot_git)
-            && let Some(path) = pointer.trim().strip_prefix("gitdir: ")
-        {
-            let path = PathBuf::from(path);
-            let git_dir = if path.is_absolute() {
-                path
-            } else {
-                directory.join(path)
-            };
-            return git_dir.join("cabal-runtime");
-        }
+    let discovered = Command::new("git")
+        .args(["rev-parse", "--absolute-git-dir"])
+        .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    if let Ok(output) = discovered
+        && output.status.success()
+        && let Ok(raw_path) = std::str::from_utf8(&output.stdout)
+        && let Ok(git_dir) = fs::canonicalize(raw_path.trim())
+        && git_dir.is_dir()
+    {
+        return git_dir.join("cabal-runtime");
     }
     cwd.join(".cabal").join("git-runtime")
 }
 
 fn file_cache_root(cwd: &Path) -> PathBuf {
     git_runtime_root(cwd).join("file-cache")
+}
+
+fn completion_contract_path(cwd: &Path) -> PathBuf {
+    cwd.join(".cabal").join("completion").join("contract.json")
+}
+
+fn completion_state_root(cwd: &Path) -> PathBuf {
+    git_runtime_root(cwd).join("completion")
 }
 
 fn build_executor_command(executable: &Path, subcommand: &str, request_path: &Path) -> String {
@@ -1581,6 +1698,7 @@ mod tests {
             request.cargo_args,
             ["+nightly", "test", "-p", "cabal-runtime-hook"]
         );
+        assert_eq!(request.receipt_args, request.cargo_args);
         assert_eq!(request.kind, CargoExecutionKind::TestText);
     }
 
@@ -1600,6 +1718,138 @@ mod tests {
                 "-D",
                 "warnings"
             ]
+        );
+        assert_eq!(
+            request.receipt_args,
+            ["+nightly", "clippy", "--", "-D", "warnings"]
+        );
+    }
+
+    #[test]
+    fn completion_stop_returns_valid_pass_json_without_contract_and_on_recursion() {
+        let workspace = tempfile::tempdir().unwrap();
+        for output in [
+            evaluate_stop(StopInput {
+                hook_event_name: "Stop".to_owned(),
+                cwd: workspace.path().to_path_buf(),
+                stop_hook_active: false,
+            }),
+            {
+                fs::create_dir_all(workspace.path().join(".cabal/completion")).unwrap();
+                fs::write(
+                    workspace.path().join(".cabal/completion/contract.json"),
+                    r#"{"version":1,"criteria":[{"id":"tests","type":"file_exists","path":"missing"}]}"#,
+                )
+                .unwrap();
+                evaluate_stop(StopInput {
+                    hook_event_name: "Stop".to_owned(),
+                    cwd: workspace.path().to_path_buf(),
+                    stop_hook_active: true,
+                })
+            },
+        ] {
+            assert_eq!(
+                serde_json::to_string(&output).unwrap(),
+                r#"{"continue":true}"#
+            );
+        }
+    }
+
+    #[test]
+    fn completion_stop_blocks_with_only_bounded_safe_ids() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join(".cabal/completion")).unwrap();
+        fs::write(
+            workspace.path().join(".cabal/completion/contract.json"),
+            r#"{"version":1,"criteria":[{"id":"cargo-test","type":"file_exists","path":"missing"}]}"#,
+        )
+        .unwrap();
+        let output = evaluate_stop(StopInput {
+            hook_event_name: "Stop".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            stop_hook_active: false,
+        });
+        let json = serde_json::to_string(&output).unwrap();
+        assert_eq!(
+            json,
+            r#"{"decision":"block","reason":"Completion evidence missing: cargo-test."}"#
+        );
+        assert!(!json.contains(".cabal"));
+        assert!(!json.contains("sha256"));
+    }
+
+    #[test]
+    fn completion_stop_sanitizes_malformed_contract_errors() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join(".cabal/completion")).unwrap();
+        fs::write(
+            workspace.path().join(".cabal/completion/contract.json"),
+            "{private-path-and-parser-details",
+        )
+        .unwrap();
+        let output = evaluate_stop(StopInput {
+            hook_event_name: "Stop".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            stop_hook_active: false,
+        });
+        let json = serde_json::to_string(&output).unwrap();
+        assert!(json.contains("invalid_contract"));
+        assert!(!json.contains("private-path"));
+        assert!(!json.contains("parser"));
+    }
+
+    #[test]
+    fn native_cargo_execution_records_and_refreshes_completion_receipt() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join("src")).unwrap();
+        fs::create_dir_all(workspace.path().join(".cabal/completion")).unwrap();
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"completion-probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            "pub fn value() -> u8 { 1 }\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join(".cabal/completion/contract.json"),
+            r#"{"version":1,"criteria":[{"id":"cargo-check","type":"command_receipt","program":"cargo","args":["check"],"input_paths":["Cargo.toml","src"]}]}"#,
+        )
+        .unwrap();
+
+        let request = parse_simple_cargo_command("cargo check", workspace.path()).unwrap();
+        let request_path = persist_execution_request(workspace.path(), &request).unwrap();
+        let projection = execute_cargo_request(&request_path).unwrap();
+        assert!(projection.contains("\"status\":\"passed\""));
+        assert_eq!(
+            serde_json::to_string(&evaluate_stop(StopInput {
+                hook_event_name: "Stop".to_owned(),
+                cwd: workspace.path().to_path_buf(),
+                stop_hook_active: false,
+            }))
+            .unwrap(),
+            r#"{"continue":true}"#
+        );
+
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            "pub fn value() -> MissingType { todo!() }\n",
+        )
+        .unwrap();
+        let request = parse_simple_cargo_command("cargo check", workspace.path()).unwrap();
+        let request_path = persist_execution_request(workspace.path(), &request).unwrap();
+        let projection = execute_cargo_request(&request_path).unwrap();
+        assert!(projection.contains("\"status\":\"failed\""));
+        let blocked = evaluate_stop(StopInput {
+            hook_event_name: "Stop".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            stop_hook_active: false,
+        });
+        assert_eq!(
+            blocked.reason.as_deref(),
+            Some("Completion evidence missing: cargo-check.")
         );
     }
     #[test]

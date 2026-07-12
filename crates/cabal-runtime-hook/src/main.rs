@@ -3,9 +3,9 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 
 use cabal_runtime_hook::{
-    HookOutput, PostToolUseInput, PreToolUseInput, execute_cargo_request,
+    HookOutput, PostToolUseInput, PreToolUseInput, StopInput, evaluate_stop, execute_cargo_request,
     execute_file_read_request, execute_git_request, execute_log_request, fallback_output,
-    invalidate_file_read_cache, prepare_pre_tool_use, project_post_tool_use,
+    invalidate_file_read_cache, prepare_pre_tool_use, project_post_tool_use, stop_wire_failure,
 };
 
 fn main() {
@@ -18,8 +18,20 @@ fn main() {
         Some(command) if command == "execute-git" => run_execute_git(args),
         Some(command) if command == "execute-file-read" => run_execute_file_read(args),
         Some(command) if command == "invalidate-file-cache" => run_invalidate_file_cache(),
+        Some(command) if command == "stop" => run_stop(),
         Some(_) => print_output(fallback_output()),
         None => run_post_tool_use(),
+    }
+}
+
+fn run_stop() {
+    let output = read_stdin()
+        .ok()
+        .and_then(|input| serde_json::from_str::<StopInput>(&input).ok())
+        .map(evaluate_stop)
+        .unwrap_or_else(stop_wire_failure);
+    if let Ok(json) = serde_json::to_string(&output) {
+        println!("{json}");
     }
 }
 

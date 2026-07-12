@@ -1,7 +1,7 @@
 {
   "name": "cabal-runtime",
-  "version": "0.5.0+codex.local-20260712-233823",
-  "description": "Native context projection for supported Cargo commands, structured logs, Git deltas, and repeated file reads.",
+  "version": "0.6.0+codex.local-20260713-000455",
+  "description": "Native context projection and deterministic opt-in completion evidence for standard Codex CLI.",
   "author": {
     "name": "Korino1",
     "email": "necroticus1@gmail.com",

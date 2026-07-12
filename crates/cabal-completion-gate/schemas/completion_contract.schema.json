@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cabal.runtime/schemas/completion_contract.schema.json",
+  "title": "Cabal Completion Contract",
+  "type": "object",
+  "required": ["version", "criteria"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": 1 },
+    "criteria": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["id", "type", "program", "args", "input_paths"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$" },
+              "type": { "const": "command_receipt" },
+              "program": { "const": "cargo" },
+              "args": { "type": "array", "items": { "type": "string" } },
+              "input_paths": { "type": "array", "maxItems": 64, "items": { "type": "string", "minLength": 1, "maxLength": 4096 } }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["id", "type", "path"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$" },
+              "type": { "const": "file_exists" },
+              "path": { "type": "string", "minLength": 1, "maxLength": 4096 }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["id", "type", "path"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$" },
+              "type": { "const": "file_absent" },
+              "path": { "type": "string", "minLength": 1, "maxLength": 4096 }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["id", "type", "path", "sha256"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$" },
+              "type": { "const": "file_sha256" },
+              "path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+              "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
