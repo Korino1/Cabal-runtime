@@ -818,6 +818,7 @@ fn prepare_state_root(git_dir: &Path, path: &Path) -> Result<(PathBuf, Dir), Rep
     {
         return Err(RepositoryMapError::StateRootOutsideGitService);
     }
+    reject_symlink_components(&git_dir, &relative)?;
     let git_cap = Dir::open_ambient_dir(&git_dir, ambient_authority())?;
     git_cap.create_dir_all(&relative)?;
     let state_dir = git_cap.open_dir(&relative)?;
@@ -826,6 +827,25 @@ fn prepare_state_root(git_dir: &Path, path: &Path) -> Result<(PathBuf, Dir), Rep
         return Err(RepositoryMapError::StateRootOutsideGitService);
     }
     Ok((canonical, state_dir))
+}
+
+fn reject_symlink_components(root: &Path, relative: &Path) -> Result<(), RepositoryMapError> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(RepositoryMapError::StateRootOutsideGitService);
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(RepositoryMapError::StateRootOutsideGitService);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn relative_state_path(git_dir: &Path, path: &Path) -> Result<PathBuf, RepositoryMapError> {
@@ -871,6 +891,7 @@ fn open_existing_state_dir(
     {
         return Err(RepositoryMapError::StateRootOutsideGitService);
     }
+    reject_symlink_components(&git_dir, &relative)?;
     let git_cap = Dir::open_ambient_dir(&git_dir, ambient_authority())?;
     match git_cap.open_dir(relative) {
         Ok(state_dir) => Ok(Some(state_dir)),
