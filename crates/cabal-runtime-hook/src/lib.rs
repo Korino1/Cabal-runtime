@@ -29,9 +29,16 @@ use cabal_log::{
     InputKind as LogInputKind, LogPack, Verdict as LogVerdict, normalize_bytes as normalize_log,
 };
 use cabal_observe::{InputKind, ObservationPack, normalize_bytes as normalize_observation};
+use cabal_repository_map::{
+    RepositoryMapError, current_for as current_map, estimated_visible_file_list_bytes,
+    inventory_bytes, read_private_request, refresh as refresh_map, visible_inventory,
+    write_private_request,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+const MAX_REPOSITORY_REQUEST_BYTES: u64 = 16_384;
 
 #[derive(Debug, Deserialize)]
 pub struct PostToolUseInput {
@@ -203,6 +210,11 @@ struct FileReadExecutionRequest {
     path: PathBuf,
     session_id: String,
     requested: RequestedRange,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct RepositoryInventoryRequest {
+    version: u8,
 }
 
 #[derive(Debug, Serialize)]
@@ -401,6 +413,7 @@ pub enum HookError {
     Observation(cabal_observe::NormalizeError),
     Delta(cabal_delta::DeltaError),
     Log(cabal_log::NormalizeError),
+    RepositoryMap(RepositoryMapError),
     InvalidInput(&'static str),
 }
 
@@ -412,6 +425,7 @@ impl std::fmt::Display for HookError {
             Self::Observation(error) => write!(formatter, "observation error: {error}"),
             Self::Delta(error) => write!(formatter, "delta error: {error}"),
             Self::Log(error) => write!(formatter, "log error: {error}"),
+            Self::RepositoryMap(error) => write!(formatter, "repository map error: {error}"),
             Self::InvalidInput(message) => write!(formatter, "invalid hook input: {message}"),
         }
     }
@@ -449,6 +463,12 @@ impl From<cabal_log::NormalizeError> for HookError {
     }
 }
 
+impl From<RepositoryMapError> for HookError {
+    fn from(error: RepositoryMapError) -> Self {
+        Self::RepositoryMap(error)
+    }
+}
+
 /// Rewrites a narrow, shell-free Cargo invocation to the native executor.
 /// Unsupported command shapes are left untouched so the hook never changes
 /// semantics it cannot reproduce without a shell.
@@ -473,7 +493,32 @@ pub fn prepare_pre_tool_use(
         return Ok(None);
     }
 
-    let rewritten_command = if let Some(request) = parse_simple_cargo_command(command, &input.cwd) {
+    let rewritten_command = if is_repository_inventory_command(command) {
+        let Some((workspace, state_root)) = repository_map_location(&input.cwd) else {
+            return Ok(None);
+        };
+        if let Ok(Some(current)) = current_map(&workspace, &state_root) {
+            let current_projection = visible_inventory(&current);
+            if inventory_bytes(&current_projection).len()
+                >= estimated_visible_file_list_bytes(&current)
+            {
+                return Ok(None);
+            }
+        }
+        let refreshed = match refresh_map(&workspace, &state_root) {
+            Ok(refreshed) => refreshed,
+            Err(_) => return Ok(None),
+        };
+        let projection = visible_inventory(&refreshed.index);
+        if inventory_bytes(&projection).len() >= estimated_visible_file_list_bytes(&refreshed.index)
+        {
+            return Ok(None);
+        }
+        let payload = serde_json::to_vec(&RepositoryInventoryRequest { version: 1 })?;
+        let request_id = private_request_id(&payload)?;
+        write_private_request(&workspace, &state_root, &request_id, &payload)?;
+        build_inventory_executor_command(executable, &request_id)
+    } else if let Some(request) = parse_simple_cargo_command(command, &input.cwd) {
         let request_path = persist_execution_request(&input.cwd, &request)?;
         build_executor_command(executable, "execute-cargo", &request_path)
     } else if let Some(request) = parse_simple_log_command(command, &input.cwd) {
@@ -492,6 +537,45 @@ pub fn prepare_pre_tool_use(
     };
 
     Ok(Some(PreToolUseOutput::rewrite(rewritten_command)))
+}
+
+/// Refreshes the private map without producing model-visible content.
+pub fn refresh_repository_map(cwd: &Path) -> Result<(), HookError> {
+    let (workspace, state_root) = repository_map_location(cwd)
+        .ok_or(HookError::InvalidInput("Git repository unavailable"))?;
+    refresh_map(&workspace, &state_root)?;
+    Ok(())
+}
+
+/// Executes one capability-confined request and returns only its bounded projection.
+pub fn execute_repository_inventory_request(
+    cwd: &Path,
+    request_id: &str,
+) -> Result<String, HookError> {
+    let (workspace, state_root) = repository_map_location(cwd)
+        .ok_or(HookError::InvalidInput("Git repository unavailable"))?;
+    let raw_request = read_private_request(
+        &workspace,
+        &state_root,
+        request_id,
+        MAX_REPOSITORY_REQUEST_BYTES,
+    )?;
+    let request = serde_json::from_slice::<RepositoryInventoryRequest>(&raw_request)?;
+    if request.version != 1 {
+        return Err(HookError::InvalidInput(
+            "repository inventory request is incompatible",
+        ));
+    }
+    let index = current_map(&workspace, &state_root)?
+        .ok_or(HookError::InvalidInput("repository inventory unavailable"))?;
+    let projection = visible_inventory(&index);
+    if inventory_bytes(&projection).len() >= estimated_visible_file_list_bytes(&index) {
+        return Err(HookError::InvalidInput(
+            "repository inventory is not context-efficient",
+        ));
+    }
+    String::from_utf8(inventory_bytes(&projection))
+        .map_err(|_| HookError::InvalidInput("repository inventory encoding failed"))
 }
 
 fn evaluate_change_policy(input: &PreToolUseInput, command: &str) -> Option<PreToolUseOutput> {
@@ -1010,6 +1094,38 @@ fn parse_simple_git_command(command: &str, cwd: &Path) -> Option<GitExecutionReq
     })
 }
 
+fn is_repository_inventory_command(command: &str) -> bool {
+    matches!(command, "rg --files" | "rg --files .")
+}
+
+fn repository_map_location(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
+    let workspace = git_resolved_path(cwd, "--show-toplevel")?;
+    let git_dir = git_resolved_path(cwd, "--absolute-git-dir")?;
+    if !workspace.is_dir() || !git_dir.is_dir() {
+        return None;
+    }
+    Some((
+        workspace,
+        git_dir.join("cabal-runtime").join("repository-map"),
+    ))
+}
+
+fn git_resolved_path(cwd: &Path, argument: &str) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", argument])
+        .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = std::str::from_utf8(&output.stdout).ok()?.trim();
+    fs::canonicalize(path).ok()
+}
+
 fn is_safe_revision(revision: &str) -> bool {
     !revision.is_empty()
         && revision.len() <= 128
@@ -1085,6 +1201,17 @@ fn persist_request_at(root: &Path, request: &impl Serialize) -> Result<PathBuf, 
     Ok(path)
 }
 
+fn private_request_id(payload: &[u8]) -> Result<String, HookError> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| HookError::InvalidInput("system clock is before Unix epoch"))?
+        .as_nanos();
+    Ok(format!(
+        "{:x}.json",
+        Sha256::digest([payload, timestamp.to_string().as_bytes()].concat())
+    ))
+}
+
 fn git_runtime_root(cwd: &Path) -> PathBuf {
     let discovered = Command::new("git")
         .args(["rev-parse", "--absolute-git-dir"])
@@ -1132,6 +1259,23 @@ fn build_executor_command(executable: &Path, subcommand: &str, request_path: &Pa
             quote_posix_shell(&executable),
             subcommand,
             quote_posix_shell(&request_path)
+        )
+    }
+}
+
+fn build_inventory_executor_command(executable: &Path, request_id: &str) -> String {
+    let executable = executable.to_string_lossy();
+    if cfg!(windows) {
+        format!(
+            "& {} repository-inventory --request-id {}",
+            quote_powershell(&executable),
+            quote_powershell(request_id)
+        )
+    } else {
+        format!(
+            "{} repository-inventory --request-id {}",
+            quote_posix_shell(&executable),
+            quote_posix_shell(request_id)
         )
     }
 }
@@ -2499,6 +2643,141 @@ mod tests {
         let path = workspace.join(cabal_change_policy::POLICY_RELATIVE_PATH);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, serde_json::to_vec(&policy).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn repository_inventory_rewrites_only_exact_broad_commands() {
+        let workspace = tempfile::tempdir().unwrap();
+        run_git(workspace.path(), &["init"]);
+        fs::create_dir_all(workspace.path().join("src")).unwrap();
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"map-probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("src/lib.rs"), "pub struct Visible;\n").unwrap();
+        fs::create_dir_all(workspace.path().join("src/generated")).unwrap();
+        for index in 0..600 {
+            fs::write(
+                workspace
+                    .path()
+                    .join(format!("src/generated/context_heavy_module_{index:04}.rs")),
+                "pub struct Generated;\n",
+            )
+            .unwrap();
+        }
+
+        for command in ["rg --files", "rg --files ."] {
+            let output = prepare_pre_tool_use(
+                pre_tool_bash(workspace.path(), command),
+                Path::new("/opt/cabal-runtime-hook"),
+            )
+            .unwrap()
+            .unwrap();
+            let wire = serde_json::to_string(&output).unwrap();
+            assert!(wire.contains("repository-inventory"));
+            assert!(!wire.contains(command));
+            assert!(!wire.contains(&workspace.path().display().to_string()));
+            assert!(!wire.contains(".git"));
+
+            let (_, state_root) = repository_map_location(workspace.path()).unwrap();
+            let request_path = fs::read_dir(state_root.join("requests"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let request_id = request_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let projection =
+                execute_repository_inventory_request(workspace.path(), &request_id).unwrap();
+            let value: Value = serde_json::from_str(&projection).unwrap();
+            assert_eq!(value["schema"], "cabal.repository_inventory.v1");
+            assert!(value["indexed_files"].as_u64().unwrap() >= 2);
+            assert!(value.get("projected_files").is_some());
+            assert!(value.get("omitted_files").is_some());
+            assert!(!projection.contains(&workspace.path().display().to_string()));
+            assert!(!projection.contains(".git"));
+            assert!(!projection.contains("repository-map"));
+            assert!(!projection.contains("pub struct Visible"));
+        }
+
+        for command in [
+            "rg --files src",
+            "rg --files --hidden",
+            "rg --files | sort",
+            "rg --files > files.txt",
+            "rg --files; git status",
+            "RG --files",
+        ] {
+            assert!(
+                prepare_pre_tool_use(
+                    pre_tool_bash(workspace.path(), command),
+                    Path::new("/opt/cabal-runtime-hook"),
+                )
+                .unwrap()
+                .is_none(),
+                "near-miss command was rewritten: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_inventory_is_inert_without_a_git_service_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        assert!(refresh_repository_map(workspace.path()).is_err());
+        assert!(
+            prepare_pre_tool_use(
+                pre_tool_bash(workspace.path(), "rg --files"),
+                Path::new("/opt/cabal-runtime-hook"),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(!workspace.path().join(".cabal").exists());
+    }
+
+    #[test]
+    fn repository_inventory_does_not_expand_small_file_lists() {
+        let workspace = tempfile::tempdir().unwrap();
+        run_git(workspace.path(), &["init"]);
+        fs::create_dir_all(workspace.path().join("src")).unwrap();
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"small-map\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("src/lib.rs"), "pub fn small() {}\n").unwrap();
+
+        assert!(
+            prepare_pre_tool_use(
+                pre_tool_bash(workspace.path(), "rg --files"),
+                Path::new("/opt/cabal-runtime-hook"),
+            )
+            .unwrap()
+            .is_none()
+        );
+        let (_, state_root) = repository_map_location(workspace.path()).unwrap();
+        assert!(state_root.join("index-v1.json").is_file());
+        assert!(!state_root.join("requests").exists());
+    }
+
+    #[test]
+    fn repository_inventory_requests_are_capability_confined_and_bounded() {
+        let workspace = tempfile::tempdir().unwrap();
+        run_git(workspace.path(), &["init"]);
+        refresh_repository_map(workspace.path()).unwrap();
+        let (canonical_workspace, state_root) = repository_map_location(workspace.path()).unwrap();
+        assert!(execute_repository_inventory_request(workspace.path(), "../request.json").is_err());
+
+        let payload = vec![b'x'; MAX_REPOSITORY_REQUEST_BYTES as usize + 1];
+        let request_id = private_request_id(&payload).unwrap();
+        write_private_request(&canonical_workspace, &state_root, &request_id, &payload).unwrap();
+        assert!(execute_repository_inventory_request(workspace.path(), &request_id).is_err());
+        assert!(state_root.join("requests").join(request_id).is_file());
     }
 
     fn pre_tool_bash(workspace: &Path, command: &str) -> PreToolUseInput {

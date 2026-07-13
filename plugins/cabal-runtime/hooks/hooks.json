@@ -26,6 +26,19 @@
         ]
       }
     ],
+    "PostToolUse": [
+      {
+        "matcher": "^(apply_patch|Edit|Write)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cabal-runtime-hook refresh-repository-map",
+            "timeout": 30,
+            "statusMessage": "Refreshing repository map"
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "matcher": "startup|resume|clear|compact",
@@ -35,6 +48,12 @@
             "command": "cabal-runtime-hook invalidate-file-cache",
             "timeout": 10,
             "statusMessage": "Starting file observations"
+          },
+          {
+            "type": "command",
+            "command": "cabal-runtime-hook refresh-repository-map",
+            "timeout": 30,
+            "statusMessage": "Indexing repository"
           }
         ]
       }

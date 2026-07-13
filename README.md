@@ -1,133 +1,134 @@
 # Cabal Runtime
 
-Cabal Runtime moves deterministic repository mechanics out of a model's working context. Models receive the bounded semantic result needed for a decision instead of raw compiler output, test logs, report noise, hashes, artifact paths, or runtime bookkeeping.
+Cabal Runtime moves deterministic, context-heavy repository mechanics behind
+standard Codex CLI hooks. The model keeps using ordinary commands. For exact
+supported forms, the plugin executes or projects the operation natively and
+returns a bounded semantic result instead of raw logs, patch bodies, repeated
+file contents, repository bookkeeping, or an unnecessarily large file list.
 
-## Native Codex Integration
+No Codex fork is used. The model does not call a Cabal MCP tool, load a Cabal
+skill, or perform an extra workflow step.
 
-The bundled `cabal-runtime` plugin uses the standard Codex `PreToolUse` hook. It transparently rewrites only recognized simple Bash tool calls before execution. The model does not call a Cabal tool, load a Cabal skill, or perform an extra workflow step.
+## How Context Noise Is Removed
 
-The native Rust gateway:
+The installed plugin uses standard `PreToolUse`, `PostToolUse`, `SessionStart`,
+`PostCompact`, and `Stop` hooks.
 
-- executes recognized commands directly without a shell;
-- stores complete stdout, stderr, and report bytes under ignored `.cabal/artifacts/`;
-- returns a bounded JSON projection with verdicts, counts, actionable diagnostics, and source locations;
-- excludes progress noise, captured output, hashes, artifact paths, and Cabal bookkeeping from the model-facing result;
-- leaves unrecognized or composed shell commands unchanged.
+1. Codex requests an ordinary supported command.
+2. `PreToolUse` recognizes only a frozen exact grammar and uses
+   `updatedInput` to route it to `cabal-runtime-hook`.
+3. The Rust runtime keeps raw data and private indexes outside model context.
+4. The command result contains only bounded decision-relevant fields, explicit
+   omissions, and completeness status.
+5. Unsupported commands receive no Cabal rewrite and retain normal Codex
+   behavior.
 
-This runs in the standard Codex CLI without a fork. Transparency applies to the supported hook paths listed below; Cabal does not claim interception of every possible Codex tool or shell expression.
+This is transparent for the supported hook paths, not universal interception.
+Cabal does not claim control over unsupported tools, arbitrary shell syntax,
+all `unified_exec` paths, or MCP-side mutations.
 
 ## Implemented Modules
 
 ### Cargo Gateway
 
-Simple `cargo build`, `cargo check`, `cargo clippy`, and `cargo test` calls are redirected to the native gateway. Compiler and test output is normalized while error codes, locations, verdicts, and failure summaries are retained.
+Simple `cargo build`, `cargo check`, `cargo clippy`, and `cargo test` commands
+run through the native gateway. Full compiler and test streams stay in local
+ignored artifacts. The model receives verdicts, error codes, actionable
+diagnostics, source locations, and test summaries without build progress noise.
 
 ### Artifact and Log Gateway
 
-Simple report reads are redirected when their file name identifies a supported format:
-
-- `Get-Content report.junit.xml` or `cat report.junit.xml`: JUnit XML;
-- `Get-Content report.sarif` or `cat report.sarif.json`: SARIF 2.1.0;
-- `Get-Content report.nextest.log` or `cat report.nextest.log`: nextest text;
-- `Get-Content report.log` or `cat report.log`: bounded generic diagnostics.
-
-Simple `cargo nextest run ...` calls are also recognized. JUnit `system-out`/`system-err`, repetitive log lines, and non-actionable report structure remain in the local raw artifact. The projection preserves suite/test identity, pass/fail/skip/error counts, rule IDs, messages, primary locations, and related SARIF locations. Malformed structured input produces `normalization_failed`; it never produces a false success verdict.
+Exact simple reads of `*.junit.xml`, `*.sarif`, `*.sarif.json`,
+`*.nextest.log`, and `*.log`, plus simple `cargo nextest run` commands, are
+normalized. JUnit captured output, repetitive lines, and raw report structure
+stay local. Malformed structured reports never become a false success.
 
 ### Git Delta Gateway
 
-The gateway transparently rewrites exactly four read-only command forms:
-
-- `git status`;
-- `git diff`;
-- `git diff --cached`;
-- `git show <revision>`, where the revision is a single bounded commit expression.
-
-Git runs directly without a shell, external diff drivers, or textconv. The model receives changed paths, staged/unstaged/untracked state, add/modify/delete/rename markers, file classification, binary markers, additions/deletions, and bounded hunk ranges. Patch bodies are retained only under the repository's Git service directory and are not returned to the model. Requests and artifacts do not change the worktree, index, refs, or visible Git status.
-
-The gateway rejects flags, pathspecs, revision ranges, redirection, and composed shell commands. This module does not claim symbol, API, or behavioral interpretation.
+Exactly `git status`, `git diff`, `git diff --cached`, and a bounded
+`git show <revision>` are projected into changed paths, statuses,
+classifications, counts, and hunk ranges. Patch bodies remain under the Git
+service directory. Flags, pathspecs, revision ranges, redirection, and composed
+shell commands are left unchanged.
 
 ### File Read Delta Cache
 
-The gateway recognizes four exact bounded UTF-8 text reads: `cat <path>`, `Get-Content <path>`, `Get-Content -Raw <path>`, and `sed -n '<start>,<end>p' <path>`. A first read returns the exact requested content. A repeated covered read of unchanged content returns only a small `unchanged` receipt. When the file changes, the gateway returns the exact current requested content plus bounded changed-line ranges.
-
-Observations are scoped to the Codex session and invalidated by the standard `SessionStart` and `PostCompact` lifecycle hooks. Cabal hashes the bytes on every intercepted read, so same-size rewrites and restored timestamps cannot produce a false unchanged result. Cache hashes, snapshot paths, locks, and other bookkeeping never enter model-facing output.
-
-Full-file reads are limited to 256 KiB. Line reads are limited to 400 lines and 64 KiB, paths to 4096 bytes, and changed ranges to 64 entries. Binary data, invalid UTF-8, files outside the workspace, oversized requests, flags, wildcards, and composed shell expressions are left untouched for normal Codex execution.
+Exact bounded UTF-8 reads through `cat`, `Get-Content`, and a narrow `sed -n`
+form are versioned by content hash. A repeated covered read of unchanged bytes
+returns a small `unchanged` receipt. A changed file returns current requested
+content plus bounded changed-line ranges. Binary, oversized, out-of-workspace,
+or unsupported reads remain under normal Codex execution.
 
 ### Completion Gate
 
-The opt-in Completion Gate evaluates a local versioned `.cabal/completion/contract.json` through the standard Codex `Stop` hook. An absent contract never blocks completion. A satisfied contract returns only the API-required pass JSON and creates no model-facing continuation. When deterministic evidence is missing, stale, failed, malformed, or unavailable, Codex receives one bounded continuation prompt containing only safe criterion IDs or a generic contract status. `stop_hook_active` prevents an infinite continuation loop.
-
-Supported criteria are exact successful Cargo command receipts with declared workspace input paths, regular-file existence, path absence, and exact file SHA-256. The native Cargo gateway automatically records successful matching receipts and invalidates an older receipt before every matching rerun. Contract bytes and declared input bytes are rehashed, so changed inputs, same-size replacement, restored timestamps, another checkout, or a changed contract cannot reuse stale success.
-
-Contract evaluation, receipt files, hashes, locks, paths, and diagnostic details remain outside model context. The successful path is invisible to the model. On the blocked path, the continuation itself and its concise reason are necessarily model-visible under the supported Codex `Stop` API. This module does not infer acceptance criteria from assistant prose and does not inspect the unstable transcript format. Automatic command receipts currently cover only Cargo commands routed through Cabal's native gateway.
-
-Example contract:
-
-```json
-{
-  "version": 1,
-  "criteria": [
-    {
-      "id": "workspace-tests",
-      "type": "command_receipt",
-      "program": "cargo",
-      "args": ["test", "--workspace"],
-      "input_paths": ["Cargo.toml", "src", "tests"]
-    },
-    { "id": "release-notes", "type": "file_exists", "path": "README.md" }
-  ]
-}
-```
+The opt-in `.cabal/completion/contract.json` is checked by the standard `Stop`
+hook. An absent contract is silent. A satisfied contract adds no continuation.
+Missing, stale, failed, malformed, or unavailable evidence produces one bounded
+continuation containing safe criterion IDs or a generic status. Supported
+criteria include Cargo command receipts, file existence/absence, and exact file
+SHA-256.
 
 ### Change Policy Guard
 
-The opt-in Change Policy Guard evaluates intercepted `apply_patch` calls and bounded simple Bash commands through the standard `PreToolUse` hook before the tool can mutate the workspace. Its fixed policy location is `.cabal/policy/change_policy.json`. Without that file, the module emits no decision and changes no existing gateway behavior.
+The opt-in `.cabal/policy/change_policy.json` checks canonical `apply_patch`
+and bounded simple Bash mutations before execution. It covers declared path
+classes, workspace and existing-symlink containment, patch limits, exact
+command rules, and built-in destructive forms. Allow is silent. Deny uses the
+native `permissionDecision: "deny"` wire with one bounded code. Unsupported
+grammar receives no policy decision.
 
-For `apply_patch`, the guard validates every add, update, delete, and move path; workspace containment and existing symlink ancestors; allow/deny, internal, and generated path classes; patch byte size; distinct file count; and changed-line count. For Bash, it matches exact bounded argument arrays and built-in destructive forms. Unsupported shell composition or quoting receives no policy decision and remains under normal Codex behavior. The evaluator never executes a command or applies a patch.
+### Repository Map
 
-Allowed requests produce no policy output, preserving Codex's normal permission flow. Denied requests use the native `permissionDecision: "deny"` wire and expose only one bounded decision code. Policy and input digests, timestamps, locks, receipts, commands, patches, and paths remain local under ignored `.cabal/` state and do not enter model context. A policy action of `ask` is conservatively mapped to `deny` because the current standard Codex `PreToolUse` API reports `ask` as unsupported and otherwise continues the original call.
+M-009 maintains `cabal.repository_map.v1` privately under the repository Git
+service directory. It records:
 
-Example policy:
+- normalized file facts, SHA-256 versions, classifications, and explicit parse
+  status;
+- Cargo workspace packages, targets, and direct package dependency edges from
+  `cargo metadata`;
+- Rust modules, definitions, public/restricted visibility, imports, syntactic
+  references, qualified impl/trait methods, tests, and test-to-symbol
+  references from the `syn` AST;
+- hard omission counters and complete/bounded/Cargo-unavailable state.
 
-```json
-{
-  "version": 1,
-  "paths": {
-    "allow": ["src/**", "tests/**", "README.md"],
-    "deny": ["secrets/**"],
-    "internal": [".cabal/**", ".codex/**", ".memoryx/**"],
-    "generated": ["target/**", "dist/**"]
-  },
-  "rules": { "internal": "deny", "generated": "deny" },
-  "limits": { "max_patch_bytes": 65536, "max_files": 32, "max_line_changes": 2000 },
-  "commands": {
-    "allow": [["cargo", "test"]],
-    "ask": [["cargo", "fmt"]],
-    "deny": [["git", "reset", "--hard"]],
-    "destructive": [["rm", "-rf", "target"]]
-  }
-}
-```
+The index is refreshed silently on `SessionStart`, after supported edit tools,
+and before a broad inventory rewrite when the current map predicts a smaller
+projection. Unchanged files reuse parsed
+facts; changed, added, and deleted files invalidate the corresponding facts.
+The runtime excludes `.git`, does not follow symlinks, rejects state outside the
+Git service directory, and atomically persists a deterministic bounded index.
 
-This is a guardrail over the exact tool paths intercepted by the current Codex hook API, not a claim of universal mutation interception. Equivalent actions through unsupported tools, incomplete `unified_exec` interception, MCP tools, or unrecognized shell forms remain outside this module's enforcement boundary.
+For exactly `rg --files` and `rg --files .`, `PreToolUse` may return a bounded
+`cabal.repository_inventory.v1` instead of the full list. The rewrite occurs
+only when the projection is smaller than the estimated native result. Small
+repositories therefore pass through unchanged rather than receiving more
+context. Unsupported arguments, hidden-file flags, pipes, redirects, and
+compound commands are never rewritten by this module.
+
+In a local 2,003-file fixture, the native file list was 118,038 UTF-8 bytes and
+the bounded inventory was 15,990 bytes, an 86.45% reduction. This fixture is a
+regression measurement, not a universal performance claim. The projection
+reported 256 retained paths and 1,747 omitted paths explicitly.
+
+The full symbol/reference map is currently private infrastructure. Task-intent
+retrieval and model-facing relevant code spans belong to the next independent
+module; this release does not claim that capability.
 
 ### Supporting Normalizers
 
-- `cabal-observe` normalizes Cargo/rustc JSON and textual test output.
-- `cabal-delta` normalizes an already captured unified Git diff.
-- `cabal-log` independently normalizes JUnit XML, SARIF 2.1.0, nextest text, and generic logs.
+- `cabal-observe`: Cargo/rustc JSON and textual test normalization.
+- `cabal-delta`: captured unified Git diff normalization.
+- `cabal-log`: JUnit XML, SARIF 2.1.0, nextest, and generic log normalization.
+- `cabal-repository-map`: deterministic repository and Rust syntax facts.
 
 ## Requirements
 
-- Rust nightly
-- Rust edition 2024
+- Rust nightly, edition 2024
 - Windows 11 or Linux
-- No `unsafe` code
+- No `unsafe` code in the Cabal Runtime workspace
+- Standard Codex CLI with plugin and hook support
 
-## Install in Codex CLI
-
-From the repository root:
+## Install In Codex CLI
 
 ```powershell
 cargo +nightly install --path crates/cabal-runtime-hook --force
@@ -135,7 +136,9 @@ codex plugin marketplace add .
 codex plugin add cabal-runtime@cabal-runtime-local
 ```
 
-Review and trust the installed hook through `/hooks` before ordinary Codex use. The `--dangerously-bypass-hook-trust` flag is reserved for controlled validation and is not required for normal operation after trust is recorded.
+Review and trust the installed hook through `/hooks` before ordinary use. The
+`--dangerously-bypass-hook-trust` option is reserved for controlled validation
+and is not part of normal operation.
 
 ## Validate
 
@@ -145,56 +148,137 @@ cargo +nightly test --workspace --all-targets
 cargo +nightly clippy --workspace --all-targets -- -D warnings
 ```
 
-CI runs the test suite on Windows and Linux. Regression tests verify JUnit context reduction and prove that all Git gateway queries leave HEAD, index, and visible status unchanged while patch bodies remain outside model-facing output.
-
-File-cache regression tests cover repeated and newly requested ranges, BOM and Unicode, CRLF and missing final newlines, same-metadata rewrites, rapid changes, concurrent readers, session changes, compact invalidation, rename/delete behavior, path containment, invalid UTF-8, and size limits.
-
-Completion-gate tests cover silent pass, bounded block, malformed contracts, missing/failed/stale receipts, failed-run invalidation, file predicates, same-size replacement, workspace containment, Unicode, symlinks, directory cycles, concurrency, deterministic ordering, recursion, prompt-injection resistance, and native Cargo receipt integration.
-
-Change-policy tests cover inert and silent paths, add/update/delete/move parsing, malformed patches, path classes, size limits, quoting, shell composition, traversal, Windows and Linux path forms, symlink escape, receipt containment and concurrency, bounded deny output, and preservation of existing gateway rewrites.
+CI runs the same workspace tests on Windows and Ubuntu. Repository-map tests
+cover deterministic bytes, known symbols/imports/references/tests, qualified
+methods, incremental reuse/change/delete, Cargo refresh, malformed and
+oversized sources, projection leakage, bounds, corrupt indexes, Git
+containment, symlink omission, exact rewrites, near misses, and the
+context-effectiveness gate.
 
 ## License
 
 Dual-licensed under MIT or Apache-2.0.
 
-## Описание на русском
+---
 
-### Кэш дельт чтения файлов
+# Cabal Runtime: описание на русском
 
-Gateway распознаёт четыре точные ограниченные формы чтения UTF-8 текста: `cat <path>`, `Get-Content <path>`, `Get-Content -Raw <path>` и `sed -n '<start>,<end>p' <path>`. Первое чтение возвращает точное запрошенное содержимое. Повторное чтение уже просмотренного и неизменённого диапазона возвращает только короткую квитанцию `unchanged`. После изменения файла модель получает точное текущее содержимое запрошенного диапазона и ограниченный список изменённых диапазонов строк.
+Cabal Runtime переносит детерминированную и объёмную техническую работу за
+пределы рабочего контекста модели через штатные hooks стандартного Codex CLI.
+Модель продолжает использовать обычные команды. Для точно поддерживаемых форм
+плагин нативно выполняет или проецирует операцию и возвращает ограниченный
+семантический результат вместо сырых логов, тел patch, повторного содержимого
+файлов, служебных данных runtime или чрезмерно большого списка файлов.
 
-Наблюдения изолированы по сессии Codex и сбрасываются штатными hooks `SessionStart` и `PostCompact`. При каждом перехваченном чтении Cabal заново хеширует байты, поэтому замена файла с тем же размером и восстановленным временем изменения не создаёт ложный результат `unchanged`. Хеши, пути снимков, блокировки и служебное состояние не передаются модели.
+Fork Codex не используется. Модель не вызывает отдельный MCP-инструмент Cabal,
+не загружает skill Cabal и не выполняет дополнительных шагов.
 
-Полное чтение ограничено 256 КиБ. Диапазон ограничен 400 строками и 64 КиБ, путь — 4096 байтами, список изменений — 64 элементами. Бинарные данные, невалидный UTF-8, файлы вне рабочей области, превышение лимитов, флаги, wildcard и составные shell-выражения плагин не перехватывает: их штатно исполняет Codex.
+## Как плагин устраняет контекстный мусор
 
-### Контроль завершения
+1. Codex запрашивает обычную поддерживаемую команду.
+2. `PreToolUse` распознаёт только зафиксированную точную грамматику и через
+   `updatedInput` незаметно направляет вызов в `cabal-runtime-hook`.
+3. Сырые данные, хеши, полная карта и служебные пути остаются локально вне
+   контекста модели.
+4. Модель получает только ограниченные значимые поля, явное число пропусков и
+   статус полноты.
+5. Неподдерживаемая команда не изменяется и исполняется штатным Codex.
 
-Опциональный Completion Gate проверяет локальный версионированный `.cabal/completion/contract.json` через штатный hook `Stop`. Отсутствие контракта никогда не блокирует завершение. Выполненный контракт возвращает только обязательный для API pass JSON и не создаёт видимого модели продолжения. Если детерминированное доказательство отсутствует, устарело, завершилось ошибкой, контракт повреждён или проверка недоступна, Codex получает один ограниченный continuation prompt только с безопасными ID критериев либо общим статусом контракта. `stop_hook_active` предотвращает бесконечный цикл продолжений.
+Прозрачность действует только на перечисленных путях hook API. Проект не
+заявляет полный перехват произвольного shell, всех вариантов `unified_exec`,
+MCP-мутаций или неизвестных инструментов.
 
-Поддерживаются точные receipts успешных Cargo-команд с объявленными входными путями, существование обычного файла, отсутствие пути и точный SHA-256 файла. Нативный Cargo gateway автоматически записывает совпавший успешный receipt и инвалидирует прежний receipt перед каждым повторным запуском. Байты контракта и объявленных входов хешируются заново, поэтому изменённые исходники, замена того же размера, восстановленное время, другой checkout или изменение контракта не могут повторно использовать устаревший успех.
+## Реализованные модули
 
-Проверка, receipts, хеши, блокировки, пути и диагностические подробности не попадают в контекст модели. Успешный путь невидим модели. При блокировке сам факт продолжения и краткая причина неизбежно видимы модели в рамках API `Stop`. Модуль не извлекает критерии из текста ответа модели и не читает нестабильный transcript. Автоматические command receipts пока создаются только для Cargo-команд нативного gateway Cabal.
+### Cargo Gateway
 
-### Контроль политики изменений
+Простые `cargo build`, `cargo check`, `cargo clippy` и `cargo test` выполняются
+через нативный gateway. Полный поток компилятора и тестов остаётся в локальных
+игнорируемых артефактах. Модель получает итог, коды ошибок, важные диагностики,
+координаты и сводку тестов без шума процесса сборки.
 
-Опциональный Change Policy Guard проверяет перехваченные вызовы `apply_patch` и ограниченные простые Bash-команды через штатный hook `PreToolUse` до возможного изменения файлов. Policy хранится в `.cabal/policy/change_policy.json`. Если файла нет, модуль ничего не выводит и не влияет на работу остальных gateway.
+### Artifact and Log Gateway
 
-Для `apply_patch` проверяются все пути добавления, изменения, удаления и переноса, нахождение внутри workspace, существующие symlink-предки, allow/deny-классы, внутренние и generated-файлы, размер patch, число файлов и число изменяемых строк. Для Bash policy сопоставляет точные ограниченные массивы аргументов и встроенные destructive-формы. Неподдерживаемая shell-композиция или quoting не получает решения policy и остаётся под штатным контролем Codex. Evaluator не запускает команду и не применяет patch.
+Точные простые чтения JUnit, SARIF, nextest и обычных `*.log`, а также простые
+`cargo nextest run`, нормализуются. Захваченный тестовый вывод, повторяющиеся
+строки и сырая структура отчёта не попадают модели. Повреждённый
+структурированный отчёт никогда не объявляется успешным.
 
-Разрешённый запрос не создаёт model-visible вывода и сохраняет штатную permission-схему Codex. Запрещённый запрос возвращает нативный `permissionDecision: "deny"` только с коротким безопасным кодом. Policy, хеши входов, timestamps, locks, receipts, команды, patch и пути остаются в игнорируемом состоянии `.cabal/` и не попадают в контекст модели. Действие policy `ask` преобразуется в `deny`, поскольку текущий API стандартного Codex помечает `PreToolUse ask` как неподдерживаемый и иначе продолжает исходный вызов.
+### Git Delta Gateway
 
-Это guardrail только для точных путей инструментов, которые перехватывает текущий hook API. Модуль не заявляет универсальный контроль действий через неподдерживаемые инструменты, неполный перехват `unified_exec`, MCP или нераспознанные shell-формы.
+Только `git status`, `git diff`, `git diff --cached` и ограниченный
+`git show <revision>` преобразуются в пути, статусы, классификации, счётчики и
+диапазоны hunks. Тела patch остаются в служебном каталоге Git. Флаги, pathspec,
+диапазоны revisions, перенаправление и составные команды не перехватываются.
 
-Cabal Runtime переносит детерминированную техническую обработку за пределы рабочего контекста модели. Вместо сырых логов компиляции и тестов, шума отчётов, хешей, путей артефактов и внутренних записей модель получает ограниченный семантический результат, необходимый для следующего решения.
+### File Read Delta Cache
 
-Плагин `cabal-runtime` использует штатный hook `PreToolUse` стандартного Codex CLI. До выполнения он незаметно перенаправляет только распознанные простые вызовы Bash. Модель не вызывает инструмент Cabal, не загружает skill Cabal и не выполняет дополнительных шагов. Fork Codex не используется.
+Точные ограниченные UTF-8 чтения через `cat`, `Get-Content` и узкую форму
+`sed -n` версионируются по хешу содержимого. Повторное чтение неизменённых уже
+покрытых байтов возвращает короткий статус `unchanged`. После изменения
+возвращается актуальный запрошенный фрагмент и ограниченные диапазоны
+изменённых строк. Неподдерживаемые чтения выполняются штатно.
 
-Реализованный Cargo Gateway обрабатывает простые команды `cargo build`, `cargo check`, `cargo clippy` и `cargo test`. Полные stdout и stderr сохраняются локально в игнорируемом каталоге `.cabal/artifacts/`, а в контекст модели возвращаются итог, коды ошибок, важные диагностики, координаты в исходниках и сводка тестов.
+### Completion Gate
 
-Реализованный Artifact and Log Gateway перехватывает простое чтение файлов `*.junit.xml`, `*.sarif`, `*.sarif.json`, `*.nextest.log` и `*.log`, а также простые вызовы `cargo nextest run`. Он поддерживает JUnit XML, SARIF 2.1.0, текст nextest и ограниченную обработку обычных логов. В контексте сохраняются идентификаторы suite/test, счётчики pass/fail/skip/error, rule ID, сообщения и координаты. `system-out`, `system-err`, повторяющиеся строки и служебная структура остаются только в локальном сыром артефакте. Повреждённый структурированный отчёт получает статус `normalization_failed` и не может быть объявлен успешным.
+Опциональный `.cabal/completion/contract.json` проверяется hook `Stop`.
+Отсутствующий или выполненный контракт не добавляет модели действий. При
+отсутствующем, устаревшем, неуспешном или повреждённом доказательстве Codex
+получает одно короткое продолжение с безопасными ID критериев или общим
+статусом.
 
-Реализованный Git Delta Gateway незаметно перехватывает только четыре read-only формы: `git status`, `git diff`, `git diff --cached` и `git show <revision>` для одного ограниченного выражения commit. Git запускается напрямую без shell, внешних diff-драйверов и textconv. Модель получает пути, staged/unstaged/untracked состояние, тип изменения, классификацию файла, binary-маркеры, счётчики additions/deletions и ограниченные диапазоны хунков. Тело patch остаётся только в служебном каталоге Git и не возвращается модели. Gateway не изменяет worktree, index, refs или видимый Git status.
+### Change Policy Guard
 
-Флаги, pathspec, диапазоны revisions, перенаправление и составные shell-команды не перехватываются. Модуль не заявляет анализ символов, API или поведения: это отдельные будущие уровни.
+Опциональный `.cabal/policy/change_policy.json` проверяет канонический
+`apply_patch` и ограниченные простые Bash-мутации до исполнения. Разрешение
+ничего не выводит. Запрет использует штатный `permissionDecision: "deny"` с
+одним коротким кодом. Неподдерживаемая грамматика не получает решения Cabal.
 
-Прозрачность действует для перечисленных поддерживаемых путей hook API. Неизвестные и составные shell-команды не изменяются; проект не заявляет перехват всех возможных инструментов Codex. Каждый нормализатор является отдельным Rust-модулем, поэтому модули выполняют свои задачи независимо и объединяются только в границе нативного gateway.
+### Repository Map
+
+M-009 скрыто ведёт `cabal.repository_map.v1` в служебном каталоге Git. Карта
+содержит версии и классификации файлов, Cargo packages/targets/dependencies, а
+также извлечённые parser-ом `syn` Rust-модули, определения, visibility, imports,
+синтаксические references, квалифицированные impl/trait methods и тесты.
+Повреждённые и слишком большие исходники, превышение bounds, ошибки Cargo и
+другие пропуски всегда отражаются явно; неполный индекс не выдаётся за полный.
+
+Карта обновляется без передачи содержимого модели на `SessionStart`, после
+поддерживаемых операций редактирования и перед rewrite инвентаризации, если
+текущая карта прогнозирует меньшую проекцию. Неизменённые файлы повторно используют разобранные факты;
+изменённые, добавленные и удалённые файлы инвалидируют соответствующие данные.
+`.git` исключён, symlinks не обходятся, а состояние вне служебного каталога Git
+отклоняется.
+
+Для точных `rg --files` и `rg --files .` плагин может незаметно вернуть
+ограниченный `cabal.repository_inventory.v1`. Rewrite выполняется только если
+проекция меньше ожидаемого штатного списка. Поэтому на маленьком репозитории
+плагин не увеличивает контекст, а оставляет команду без изменений. Флаги,
+аргументы, pipes, redirects и составные команды модуль не перехватывает.
+
+В локальном fixture на 2 003 файлах список занимал 118 038 байт UTF-8, а
+проекция 15 990 байт: сокращение 86,45%. Это регрессионное измерение, а не
+универсальная гарантия производительности. Проекция явно сообщила 256
+сохранённых и 1 747 пропущенных пути.
+
+Полная карта символов и references пока остаётся внутренней инфраструктурой.
+Выбор релевантных фрагментов по намерению задачи относится к следующему
+независимому модулю; этот релиз не заявляет такую возможность.
+
+## Установка и проверка
+
+```powershell
+cargo +nightly install --path crates/cabal-runtime-hook --force
+codex plugin marketplace add .
+codex plugin add cabal-runtime@cabal-runtime-local
+
+cargo +nightly fmt --all -- --check
+cargo +nightly test --workspace --all-targets
+cargo +nightly clippy --workspace --all-targets -- -D warnings
+```
+
+После установки новый точный hash hook необходимо один раз проверить и
+доверить через `/hooks`. Опция `--dangerously-bypass-hook-trust` предназначена
+только для контролируемых тестов и не требуется при обычной работе.
+
+Лицензия: MIT или Apache-2.0.

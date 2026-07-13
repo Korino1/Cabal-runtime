@@ -1,7 +1,7 @@
 {
   "name": "cabal-runtime",
-  "version": "0.7.0+codex.local-20260712-214918",
-  "description": "Native context projection, completion evidence, and opt-in change policy enforcement for standard Codex CLI.",
+  "version": "0.8.0+codex.local-20260713-112957",
+  "description": "Native invisible context projection, repository mapping, completion evidence, and opt-in change policy enforcement for standard Codex CLI.",
   "author": {
     "name": "Korino1",
     "email": "necroticus1@gmail.com",

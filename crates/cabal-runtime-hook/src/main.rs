@@ -4,8 +4,9 @@ use std::path::PathBuf;
 
 use cabal_runtime_hook::{
     HookOutput, PostToolUseInput, PreToolUseInput, StopInput, evaluate_stop, execute_cargo_request,
-    execute_file_read_request, execute_git_request, execute_log_request, fallback_output,
-    invalidate_file_read_cache, prepare_pre_tool_use, project_post_tool_use, stop_wire_failure,
+    execute_file_read_request, execute_git_request, execute_log_request,
+    execute_repository_inventory_request, fallback_output, invalidate_file_read_cache,
+    prepare_pre_tool_use, project_post_tool_use, refresh_repository_map, stop_wire_failure,
 };
 
 fn main() {
@@ -17,11 +18,53 @@ fn main() {
         Some(command) if command == "execute-log" => run_execute_log(args),
         Some(command) if command == "execute-git" => run_execute_git(args),
         Some(command) if command == "execute-file-read" => run_execute_file_read(args),
+        Some(command) if command == "repository-inventory" => run_repository_inventory(args),
         Some(command) if command == "invalidate-file-cache" => run_invalidate_file_cache(),
+        Some(command) if command == "refresh-repository-map" => run_refresh_repository_map(),
         Some(command) if command == "stop" => run_stop(),
         Some(_) => print_output(fallback_output()),
         None => run_post_tool_use(),
     }
+}
+
+fn run_repository_inventory(mut args: impl Iterator<Item = std::ffi::OsString>) {
+    let Some(flag) = args.next() else {
+        print_output(fallback_output());
+        return;
+    };
+    let Some(request_id) = args.next() else {
+        print_output(fallback_output());
+        return;
+    };
+    if flag != "--request-id" || args.next().is_some() {
+        print_output(fallback_output());
+        return;
+    }
+
+    let projection = env::current_dir().ok().and_then(|cwd| {
+        execute_repository_inventory_request(&cwd, &request_id.to_string_lossy()).ok()
+    });
+    match projection {
+        Some(projection) => println!("{projection}"),
+        None => print_output(fallback_output()),
+    }
+}
+
+fn run_refresh_repository_map() {
+    let cwd = read_stdin()
+        .ok()
+        .and_then(|input| serde_json::from_str::<serde_json::Value>(&input).ok())
+        .and_then(|payload| {
+            payload
+                .get("cwd")
+                .and_then(|value| value.as_str())
+                .map(PathBuf::from)
+        })
+        .or_else(|| env::current_dir().ok());
+    if let Some(cwd) = cwd {
+        let _ = refresh_repository_map(&cwd);
+    }
+    println!("{{\"continue\":true,\"suppressOutput\":true}}");
 }
 
 fn run_stop() {
