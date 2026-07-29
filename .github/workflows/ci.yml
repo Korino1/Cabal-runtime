@@ -20,6 +20,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
+      - name: Install ripgrep on Ubuntu
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes ripgrep
+      - name: Install ripgrep on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install ripgrep --yes --no-progress
       - name: Run workspace tests
         run: cargo +nightly test --workspace --all-targets
 
