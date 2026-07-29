@@ -1,13 +1,15 @@
 [package]
 name = "cabal-runtime-hook"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Native Codex context gateway with deterministic private repository indexing"
+description = "Native Codex context gateway with deterministic causal source projection"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+base64 = "0.22"
 cabal-observe = { path = "../.." }
+cabal-causal-context = { path = "../cabal-causal-context" }
 cabal-change-policy = { path = "../cabal-change-policy" }
 cabal-completion-gate = { path = "../cabal-completion-gate" }
 cabal-delta = { path = "../cabal-delta" }

@@ -1,0 +1,53 @@
+{
+  "schema": "cabal.public_metric_aggregate.v1",
+  "module": "M-010",
+  "version": "0.9.0",
+  "status": "accepted",
+  "accepted_run_id": "20260729T225045Z-7999e369f15643ef88cd3e8b3efba61d",
+  "capture_sha256": "ae1bd93034d1283d145978877212ea1f5655beaf6edcbf849e710a0c5b4a17ff",
+  "frozen_manifest_sha256": "371beaf421b43cf973f4343817aad54d7a3219afe8218dda2c43195ecffa613d",
+  "fixture": {
+    "id": "large-context",
+    "source_bytes": 36199,
+    "source_sha256": "b4b00017b9f2561f37d25a741ac971e20dc327209363cab216a4bafeb4986b10",
+    "shape": "one Rust type, one multiline test, and 420 direct consumer functions"
+  },
+  "environment": {
+    "platform": "Windows 11",
+    "architecture": "x86_64",
+    "rust": "rustc 1.99.0-nightly (14cae6813 2026-07-08)",
+    "codex": "codex-cli 0.145.0",
+    "ripgrep": "ripgrep 15.2.0 (rev e89fff89ac)",
+    "measurement_shell": "PowerShell 7.6.4",
+    "wrapper_shell": "Windows PowerShell 5.1.26100.8521"
+  },
+  "measurement": {
+    "warmups": 2,
+    "repetitions": 9,
+    "raw_bytes": 43435,
+    "projected_bytes": 38715,
+    "reduction_percent": 10.87,
+    "raw_latency_median_ms": 13.002,
+    "raw_latency_p95_ms": 19.076,
+    "projected_latency_median_ms": 211.824,
+    "projected_latency_p95_ms": 218.872,
+    "raw_tokens": "unknown",
+    "projected_tokens": "unknown",
+    "tokenizer": "unknown"
+  },
+  "semantic_preservation": {
+    "raw_records": 432,
+    "retained_records": 432,
+    "lossless_record_recall": 1.0,
+    "inferred_labels": 0,
+    "runtime_metadata_markers": 0,
+    "deterministic_projection": true,
+    "exact_tuple_oracle": "projection_is_lossless_grouped_and_strictly_smaller"
+  },
+  "source_sha256": {
+    "crates/cabal-causal-context/src/lib.rs": "d76383cdd8c5b3dbacb1cec193409d6b9bb43842a251693d7e0a3055da43cb59",
+    "crates/cabal-runtime-hook/src/lib.rs": "b416a1b77a0df540434fc3dbab49f76dd76d45ea3d4b68e71275a36e11d754c4",
+    "windows_release_binary": "570ad5b3f6c225193b51f0675099728897be6a53935f7e510952413b3c934488"
+  },
+  "claim_boundary": "This aggregate applies only to the frozen fixture and tool versions above."
+}

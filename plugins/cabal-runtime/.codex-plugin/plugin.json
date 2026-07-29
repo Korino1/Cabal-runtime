@@ -1,7 +1,7 @@
 {
   "name": "cabal-runtime",
-  "version": "0.8.0+codex.local-20260713-112957",
-  "description": "Native invisible context projection, repository mapping, completion evidence, and opt-in change policy enforcement for standard Codex CLI.",
+  "version": "0.9.0+codex.20260729195624",
+  "description": "Native transparent context projection, repository mapping, completion evidence, and opt-in change policy enforcement for standard Codex CLI.",
   "author": {
     "name": "Korino1",
     "email": "necroticus1@gmail.com",
@@ -9,5 +9,20 @@
   },
   "repository": "https://github.com/Korino1/Cabal-runtime",
   "license": "MIT OR Apache-2.0",
-  "keywords": ["codex", "context", "runtime"]
+  "keywords": [
+    "codex",
+    "context",
+    "runtime"
+  ],
+  "interface": {
+    "displayName": "Cabal Runtime",
+    "shortDescription": "Transparent native context projection for Codex CLI",
+    "longDescription": "Reduces supported repository and command output before it reaches model context while preserving ordinary Codex CLI workflows.",
+    "developerName": "Korino1",
+    "category": "Productivity",
+    "capabilities": [
+      "Hooks"
+    ],
+    "defaultPrompt": []
+  }
 }

@@ -39,6 +39,17 @@
         ]
       }
     ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cabal-runtime-hook register-causal-frame",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "matcher": "startup|resume|clear|compact",
@@ -54,6 +65,11 @@
             "command": "cabal-runtime-hook refresh-repository-map",
             "timeout": 30,
             "statusMessage": "Indexing repository"
+          },
+          {
+            "type": "command",
+            "command": "cabal-runtime-hook cleanup-causal-context",
+            "timeout": 10
           }
         ]
       }

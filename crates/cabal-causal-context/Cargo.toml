@@ -1,0 +1,18 @@
+[package]
+name = "cabal-causal-context"
+version = "0.9.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Fail-closed lossless contextual ripgrep projection for Cabal Runtime"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+cap-std = "4.0.2"
+fs2 = "0.4"
+getrandom = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

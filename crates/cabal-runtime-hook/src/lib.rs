@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use cabal_causal_context::{
+    ExactSearch, Gateway as CausalGateway, GatewayError as CausalGatewayError,
+    Outcome as CausalOutcome,
+};
 use cabal_change_policy::{
     Decision as ChangeDecision, PolicyState as ChangePolicyState, ToolInput as ChangeToolInput,
     evaluate as evaluate_change, receipt_for as change_receipt_for,
@@ -58,6 +62,15 @@ pub struct PreToolUseInput {
     pub tool_input: Value,
     #[serde(default)]
     pub session_id: Option<String>,
+}
+
+/// Input emitted before a user prompt enters the active turn.
+#[derive(Debug, Deserialize)]
+pub struct UserPromptSubmitInput {
+    pub hook_event_name: String,
+    pub cwd: PathBuf,
+    pub session_id: String,
+    pub turn_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,22 +126,21 @@ struct PreToolUseSpecificOutput {
     )]
     permission_decision_reason: Option<String>,
     #[serde(rename = "updatedInput", skip_serializing_if = "Option::is_none")]
-    updated_input: Option<UpdatedToolInput>,
-}
-
-#[derive(Debug, Serialize)]
-struct UpdatedToolInput {
-    command: String,
+    updated_input: Option<Value>,
 }
 
 impl PreToolUseOutput {
-    fn rewrite(command: String) -> Self {
+    fn rewrite(command: String, original_input: &Value) -> Self {
+        let mut updated_input = original_input.clone();
+        if let Some(object) = updated_input.as_object_mut() {
+            object.insert("command".to_owned(), Value::String(command));
+        }
         Self {
             hook_specific_output: PreToolUseSpecificOutput {
                 hook_event_name: "PreToolUse",
                 permission_decision: "allow",
                 permission_decision_reason: None,
-                updated_input: Some(UpdatedToolInput { command }),
+                updated_input: Some(updated_input),
             },
         }
     }
@@ -414,6 +426,7 @@ pub enum HookError {
     Delta(cabal_delta::DeltaError),
     Log(cabal_log::NormalizeError),
     RepositoryMap(RepositoryMapError),
+    CausalContext(CausalGatewayError),
     InvalidInput(&'static str),
 }
 
@@ -426,6 +439,7 @@ impl std::fmt::Display for HookError {
             Self::Delta(error) => write!(formatter, "delta error: {error}"),
             Self::Log(error) => write!(formatter, "log error: {error}"),
             Self::RepositoryMap(error) => write!(formatter, "repository map error: {error}"),
+            Self::CausalContext(error) => write!(formatter, "causal context error: {error}"),
             Self::InvalidInput(message) => write!(formatter, "invalid hook input: {message}"),
         }
     }
@@ -469,6 +483,64 @@ impl From<RepositoryMapError> for HookError {
     }
 }
 
+impl From<CausalGatewayError> for HookError {
+    fn from(error: CausalGatewayError) -> Self {
+        Self::CausalContext(error)
+    }
+}
+
+/// Executor result for one already-rewritten contextual search.
+pub enum CausalExecution {
+    Projection {
+        text: String,
+        exit_code: i32,
+    },
+    RawReplay {
+        workspace: PathBuf,
+        search: ExactSearch,
+    },
+    RetryOriginal,
+}
+
+/// Stores only hashed lifecycle identity and revision state. The prompt field
+/// is intentionally not deserialized or retained.
+pub fn register_causal_frame(input: UserPromptSubmitInput) -> Result<(), HookError> {
+    if input.hook_event_name != "UserPromptSubmit" {
+        return Ok(());
+    }
+    let Some((workspace, git_dir)) = causal_context_location(&input.cwd) else {
+        return Ok(());
+    };
+    CausalGateway::open(&workspace, &git_dir)?
+        .register_frame(&input.session_id, Some(&input.turn_id))?;
+    Ok(())
+}
+
+/// Removes expired causal state during SessionStart without emitting context.
+pub fn cleanup_causal_context(cwd: &Path) -> Result<(), HookError> {
+    let Some((workspace, git_dir)) = causal_context_location(cwd) else {
+        return Ok(());
+    };
+    CausalGateway::open(&workspace, &git_dir)?.cleanup()?;
+    Ok(())
+}
+
+/// Consumes one opaque request. A rejected request asks the generated wrapper
+/// to execute the original exact command without exposing runtime diagnostics.
+pub fn execute_causal_request(cwd: &Path, token: &str) -> Result<CausalExecution, HookError> {
+    let Some((workspace, git_dir)) = causal_context_location(cwd) else {
+        return Ok(CausalExecution::RetryOriginal);
+    };
+    let gateway = CausalGateway::open(&workspace, &git_dir)?;
+    Ok(match gateway.execute_request(token) {
+        CausalOutcome::Projection { text, exit_code } => {
+            CausalExecution::Projection { text, exit_code }
+        }
+        CausalOutcome::RawReplay { search, .. } => CausalExecution::RawReplay { workspace, search },
+        CausalOutcome::Rejected { .. } => CausalExecution::RetryOriginal,
+    })
+}
+
 /// Rewrites a narrow, shell-free Cargo invocation to the native executor.
 /// Unsupported command shapes are left untouched so the hook never changes
 /// semantics it cannot reproduce without a shell.
@@ -493,7 +565,14 @@ pub fn prepare_pre_tool_use(
         return Ok(None);
     }
 
-    let rewritten_command = if is_repository_inventory_command(command) {
+    let rewritten_command = if causal_tool_input_is_exact(&input.tool_input)
+        && let Some(session_id) = input.session_id.as_deref()
+        && let Some((workspace, git_dir)) = causal_context_location(&input.cwd)
+        && let Ok(gateway) = CausalGateway::open(&workspace, &git_dir)
+        && let Ok(Some(request)) = gateway.prepare_request(session_id, &input.cwd, command)
+    {
+        build_causal_executor_command(executable, &request)
+    } else if is_repository_inventory_command(command) {
         let Some((workspace, state_root)) = repository_map_location(&input.cwd) else {
             return Ok(None);
         };
@@ -536,7 +615,10 @@ pub fn prepare_pre_tool_use(
         return Ok(None);
     };
 
-    Ok(Some(PreToolUseOutput::rewrite(rewritten_command)))
+    Ok(Some(PreToolUseOutput::rewrite(
+        rewritten_command,
+        &input.tool_input,
+    )))
 }
 
 /// Refreshes the private map without producing model-visible content.
@@ -1110,6 +1192,21 @@ fn repository_map_location(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
     ))
 }
 
+fn causal_context_location(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
+    let workspace = git_resolved_path(cwd, "--show-toplevel")?;
+    let git_dir = git_resolved_path(cwd, "--absolute-git-dir")?;
+    if !workspace.is_dir() || !git_dir.is_dir() {
+        return None;
+    }
+    Some((workspace, git_dir))
+}
+
+fn causal_tool_input_is_exact(input: &Value) -> bool {
+    input.as_object().is_some_and(|object| {
+        object.len() == 1 && object.get("command").is_some_and(Value::is_string)
+    })
+}
+
 fn git_resolved_path(cwd: &Path, argument: &str) -> Option<PathBuf> {
     let output = Command::new("git")
         .args(["rev-parse", argument])
@@ -1276,6 +1373,32 @@ fn build_inventory_executor_command(executable: &Path, request_id: &str) -> Stri
             "{} repository-inventory --request-id {}",
             quote_posix_shell(&executable),
             quote_posix_shell(request_id)
+        )
+    }
+}
+
+fn build_causal_executor_command(
+    executable: &Path,
+    request: &cabal_causal_context::PreparedRequest,
+) -> String {
+    let executable = executable.to_string_lossy();
+    let token = request.token();
+    let identifier = request.search().identifier();
+    if cfg!(windows) {
+        format!(
+            "$o=''; $s=75; if (Test-Path -LiteralPath {}) {{ $o=& {} causal-context-wire --request-id {} 2>$null; $s=$LASTEXITCODE }}; if ($s -eq 0) {{ try {{ $b=[Convert]::FromBase64String(($o -join '')); [Console]::OpenStandardOutput().Write($b,0,$b.Length); exit 0 }} catch {{ $s=75 }} }}; rg -n -C 8 -- {} .; exit $LASTEXITCODE",
+            quote_powershell(&executable),
+            quote_powershell(&executable),
+            quote_powershell(token),
+            identifier
+        )
+    } else {
+        format!(
+            "if [ -x {} ] && command -v base64 >/dev/null 2>&1; then o=$({} causal-context-wire --request-id {} 2>/dev/null); s=$?; else o=; s=75; fi; if [ \"$s\" -eq 0 ]; then d=$(printf %s \"$o\" | base64 --decode 2>/dev/null && printf .); s=$?; if [ \"$s\" -eq 0 ]; then d=${{d%?}}; printf %s \"$d\"; exit 0; fi; fi; rg -n -C 8 -- {} .; exit $?",
+            quote_posix_shell(&executable),
+            quote_posix_shell(&executable),
+            quote_posix_shell(token),
+            identifier
         )
     }
 }
@@ -1749,6 +1872,10 @@ pub fn artifact_root_for(cwd: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
     fn bash_input(command: &str, response: &str, cwd: &Path) -> PostToolUseInput {
         PostToolUseInput {
@@ -2643,6 +2770,444 @@ mod tests {
         let path = workspace.join(cabal_change_policy::POLICY_RELATIVE_PATH);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, serde_json::to_vec(&policy).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn causal_context_is_silent_until_frame_then_rewrites_and_projects() {
+        let workspace = tempfile::tempdir().unwrap();
+        run_git(workspace.path(), &["init"]);
+        fs::create_dir_all(workspace.path().join("src")).unwrap();
+        let source = (0..180)
+            .map(|index| {
+                format!("pub fn repeated_symbol_{index:03}() {{ let _ = repeated_symbol; }}\n")
+            })
+            .collect::<String>();
+        fs::write(workspace.path().join("src/repeated.rs"), source).unwrap();
+        refresh_repository_map(workspace.path()).unwrap();
+
+        let command = "rg -n -C 8 -- repeated_symbol .";
+        let without_frame = PreToolUseInput {
+            hook_event_name: "PreToolUse".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            tool_name: "Bash".to_owned(),
+            tool_input: serde_json::json!({"command": command}),
+            session_id: Some("session-m010".to_owned()),
+        };
+        assert!(
+            prepare_pre_tool_use(without_frame, Path::new("/opt/cabal-runtime-hook"))
+                .unwrap()
+                .is_none()
+        );
+
+        let prompt_wire = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "cwd": workspace.path(),
+            "session_id": "session-m010",
+            "turn_id": "turn-m010",
+            "prompt": "private prompt must never persist"
+        });
+        let prompt_input: UserPromptSubmitInput = serde_json::from_value(prompt_wire).unwrap();
+        register_causal_frame(prompt_input).unwrap();
+
+        let with_frame = PreToolUseInput {
+            hook_event_name: "PreToolUse".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            tool_name: "Bash".to_owned(),
+            tool_input: serde_json::json!({"command": command}),
+            session_id: Some("session-m010".to_owned()),
+        };
+        let output = prepare_pre_tool_use(with_frame, Path::new("/opt/cabal-runtime-hook"))
+            .unwrap()
+            .unwrap();
+        let wire = serde_json::to_value(output).unwrap();
+        let rewritten = wire["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        assert!(rewritten.contains("causal-context"));
+        assert!(rewritten.contains("--request-id"));
+        assert!(rewritten.contains("rg -n -C 8 -- repeated_symbol ."));
+        assert!(rewritten.contains("75"));
+
+        let token = rewritten
+            .split(|character: char| !character.is_ascii_hexdigit())
+            .find(|part| {
+                part.len() == 64
+                    && part.bytes().all(|byte| {
+                        byte.is_ascii_digit()
+                            || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())
+                    })
+            })
+            .unwrap();
+        let execution = execute_causal_request(workspace.path(), token).unwrap();
+        let CausalExecution::Projection { text, exit_code } = execution else {
+            panic!("expected smaller causal projection");
+        };
+        assert_eq!(exit_code, 0);
+        assert!(text.contains("src/repeated.rs:"));
+        assert!(text.contains("repeated_symbol"));
+        assert!(!text.contains("cabal"));
+
+        let (_, git_dir) = causal_context_location(workspace.path()).unwrap();
+        let private_state = fs::read_dir(git_dir.join("cabal-runtime/causal-context/frames"))
+            .unwrap()
+            .flat_map(|entry| fs::read(entry.unwrap().path()).unwrap())
+            .collect::<Vec<_>>();
+        let private_text = String::from_utf8(private_state).unwrap();
+        assert!(!private_text.contains("private prompt"));
+        assert!(!private_text.contains("session-m010"));
+        assert!(!private_text.contains("turn-m010"));
+    }
+
+    #[test]
+    fn causal_context_missing_request_uses_invisible_original_retry() {
+        let workspace = tempfile::tempdir().unwrap();
+        run_git(workspace.path(), &["init"]);
+        register_causal_frame(UserPromptSubmitInput {
+            hook_event_name: "UserPromptSubmit".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            session_id: "session-retry".to_owned(),
+            turn_id: "turn-retry".to_owned(),
+        })
+        .unwrap();
+        let input = PreToolUseInput {
+            hook_event_name: "PreToolUse".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            tool_name: "Bash".to_owned(),
+            tool_input: serde_json::json!({
+                "command": "rg -n -C 8 -- MissingRequest ."
+            }),
+            session_id: Some("session-retry".to_owned()),
+        };
+        let output = prepare_pre_tool_use(input, Path::new("/opt/cabal-runtime-hook"))
+            .unwrap()
+            .unwrap();
+        let wire = serde_json::to_value(output).unwrap();
+        let rewritten = wire["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        let token = rewritten
+            .split(|character: char| !character.is_ascii_hexdigit())
+            .find(|part| part.len() == 64)
+            .unwrap();
+        let (_, git_dir) = causal_context_location(workspace.path()).unwrap();
+        fs::remove_file(
+            git_dir
+                .join("cabal-runtime/causal-context/requests")
+                .join(format!("{token}.json")),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            execute_causal_request(workspace.path(), token).unwrap(),
+            CausalExecution::RetryOriginal
+        ));
+        assert!(rewritten.contains("rg -n -C 8 -- MissingRequest ."));
+    }
+
+    #[test]
+    fn causal_context_rejects_extra_tool_input_fields_and_other_rewrites_preserve_them() {
+        let workspace = tempfile::tempdir().unwrap();
+        run_git(workspace.path(), &["init"]);
+        register_causal_frame(UserPromptSubmitInput {
+            hook_event_name: "UserPromptSubmit".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            session_id: "session-fields".to_owned(),
+            turn_id: "turn-fields".to_owned(),
+        })
+        .unwrap();
+        let causal = PreToolUseInput {
+            hook_event_name: "PreToolUse".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            tool_name: "Bash".to_owned(),
+            tool_input: serde_json::json!({
+                "command": "rg -n -C 8 -- ExactOnly .",
+                "timeout_ms": 1000
+            }),
+            session_id: Some("session-fields".to_owned()),
+        };
+        assert!(
+            prepare_pre_tool_use(causal, Path::new("/opt/cabal-runtime-hook"))
+                .unwrap()
+                .is_none()
+        );
+
+        let cargo = PreToolUseInput {
+            hook_event_name: "PreToolUse".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            tool_name: "Bash".to_owned(),
+            tool_input: serde_json::json!({
+                "command": "cargo check",
+                "timeout_ms": 1000
+            }),
+            session_id: None,
+        };
+        let output = prepare_pre_tool_use(cargo, Path::new("/opt/cabal-runtime-hook"))
+            .unwrap()
+            .unwrap();
+        let wire = serde_json::to_value(output).unwrap();
+        assert_eq!(
+            wire["hookSpecificOutput"]["updatedInput"]["timeout_ms"],
+            1000
+        );
+    }
+
+    #[test]
+    fn missing_causal_executor_runs_the_original_search() {
+        let workspace = tempfile::tempdir().unwrap();
+        run_git(workspace.path(), &["init"]);
+        fs::write(
+            workspace.path().join("needle.rs"),
+            "pub struct LaunchNeedle;\n",
+        )
+        .unwrap();
+        register_causal_frame(UserPromptSubmitInput {
+            hook_event_name: "UserPromptSubmit".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            session_id: "session-launch".to_owned(),
+            turn_id: "turn-launch".to_owned(),
+        })
+        .unwrap();
+        let input = PreToolUseInput {
+            hook_event_name: "PreToolUse".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            tool_name: "Bash".to_owned(),
+            tool_input: serde_json::json!({
+                "command": "rg -n -C 8 -- LaunchNeedle ."
+            }),
+            session_id: Some("session-launch".to_owned()),
+        };
+        let missing = workspace.path().join("missing-cabal-runtime-hook");
+        let output = prepare_pre_tool_use(input, &missing).unwrap().unwrap();
+        let wire = serde_json::to_value(output).unwrap();
+        let rewritten = wire["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        let expected = Command::new("rg")
+            .args(["-n", "-C", "8", "--", "LaunchNeedle", "."])
+            .current_dir(workspace.path())
+            .output()
+            .unwrap();
+        #[cfg(windows)]
+        let actual = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", rewritten])
+            .current_dir(workspace.path())
+            .output()
+            .unwrap();
+        #[cfg(unix)]
+        let actual = Command::new("/bin/sh")
+            .args(["-c", rewritten])
+            .current_dir(workspace.path())
+            .output()
+            .unwrap();
+        assert_eq!(actual.status.code(), expected.status.code());
+        assert_eq!(actual.stdout, expected.stdout);
+        assert_eq!(actual.stderr, expected.stderr);
+    }
+
+    #[test]
+    fn failed_causal_executor_suppresses_its_noise_and_runs_original_search() {
+        let workspace = tempfile::tempdir().unwrap();
+        run_git(workspace.path(), &["init"]);
+        fs::write(
+            workspace.path().join("needle.rs"),
+            "pub struct CrashNeedle;\n",
+        )
+        .unwrap();
+        register_causal_frame(UserPromptSubmitInput {
+            hook_event_name: "UserPromptSubmit".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            session_id: "session-crash".to_owned(),
+            turn_id: "turn-crash".to_owned(),
+        })
+        .unwrap();
+        #[cfg(windows)]
+        let failing = {
+            let path = workspace.path().join("failing-cabal-runtime-hook.cmd");
+            fs::write(
+                &path,
+                "@echo executor-stdout\r\n@echo executor-stderr 1>&2\r\n@exit /b 101\r\n",
+            )
+            .unwrap();
+            path
+        };
+        #[cfg(unix)]
+        let failing = {
+            let path = workspace.path().join("failing-cabal-runtime-hook");
+            fs::write(
+                &path,
+                "#!/bin/sh\necho executor-stdout\necho executor-stderr >&2\nexit 101\n",
+            )
+            .unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        };
+        let input = PreToolUseInput {
+            hook_event_name: "PreToolUse".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            tool_name: "Bash".to_owned(),
+            tool_input: serde_json::json!({
+                "command": "rg -n -C 8 -- CrashNeedle ."
+            }),
+            session_id: Some("session-crash".to_owned()),
+        };
+        let output = prepare_pre_tool_use(input, &failing).unwrap().unwrap();
+        let wire = serde_json::to_value(output).unwrap();
+        let rewritten = wire["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        let expected = Command::new("rg")
+            .args(["-n", "-C", "8", "--", "CrashNeedle", "."])
+            .current_dir(workspace.path())
+            .output()
+            .unwrap();
+        #[cfg(windows)]
+        let actual = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", rewritten])
+            .current_dir(workspace.path())
+            .output()
+            .unwrap();
+        #[cfg(unix)]
+        let actual = Command::new("/bin/sh")
+            .args(["-c", rewritten])
+            .current_dir(workspace.path())
+            .output()
+            .unwrap();
+
+        assert_eq!(actual.status.code(), expected.status.code());
+        assert_eq!(actual.stdout, expected.stdout);
+        assert_eq!(actual.stderr, expected.stderr);
+        assert!(!String::from_utf8_lossy(&actual.stdout).contains("executor-stdout"));
+        assert!(!String::from_utf8_lossy(&actual.stderr).contains("executor-stderr"));
+    }
+
+    #[test]
+    fn successful_causal_wire_decodes_exact_projection_bytes() {
+        let workspace = tempfile::tempdir().unwrap();
+        run_git(workspace.path(), &["init"]);
+        fs::write(
+            workspace.path().join("needle.rs"),
+            "pub struct WireNeedle;\n",
+        )
+        .unwrap();
+        register_causal_frame(UserPromptSubmitInput {
+            hook_event_name: "UserPromptSubmit".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            session_id: "session-wire".to_owned(),
+            turn_id: "turn-wire".to_owned(),
+        })
+        .unwrap();
+        let projection = b"query WireNeedle\nsrc/wire.rs:\n  1:pub struct WireNeedle;\n";
+        let encoded = BASE64_STANDARD.encode(projection);
+        #[cfg(windows)]
+        let executor = {
+            let path = workspace.path().join("wire-cabal-runtime-hook.cmd");
+            fs::write(&path, format!("@echo {encoded}\r\n@exit /b 0\r\n")).unwrap();
+            path
+        };
+        #[cfg(unix)]
+        let executor = {
+            let path = workspace.path().join("wire-cabal-runtime-hook");
+            fs::write(&path, format!("#!/bin/sh\nprintf %s '{encoded}'\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        };
+        let input = PreToolUseInput {
+            hook_event_name: "PreToolUse".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            tool_name: "Bash".to_owned(),
+            tool_input: serde_json::json!({
+                "command": "rg -n -C 8 -- WireNeedle ."
+            }),
+            session_id: Some("session-wire".to_owned()),
+        };
+        let output = prepare_pre_tool_use(input, &executor).unwrap().unwrap();
+        let wire = serde_json::to_value(output).unwrap();
+        let rewritten = wire["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        #[cfg(windows)]
+        let actual = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", rewritten])
+            .current_dir(workspace.path())
+            .output()
+            .unwrap();
+        #[cfg(unix)]
+        let actual = Command::new("/bin/sh")
+            .args(["-c", rewritten])
+            .current_dir(workspace.path())
+            .output()
+            .unwrap();
+
+        assert_eq!(actual.status.code(), Some(0));
+        assert_eq!(actual.stdout, projection);
+        assert!(actual.stderr.is_empty());
+    }
+
+    #[test]
+    fn invalid_causal_wire_is_suppressed_and_runs_original_search() {
+        let workspace = tempfile::tempdir().unwrap();
+        run_git(workspace.path(), &["init"]);
+        fs::write(
+            workspace.path().join("needle.rs"),
+            "pub struct InvalidWireNeedle;\n",
+        )
+        .unwrap();
+        register_causal_frame(UserPromptSubmitInput {
+            hook_event_name: "UserPromptSubmit".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            session_id: "session-invalid-wire".to_owned(),
+            turn_id: "turn-invalid-wire".to_owned(),
+        })
+        .unwrap();
+        #[cfg(windows)]
+        let executor = {
+            let path = workspace.path().join("invalid-wire-cabal-runtime-hook.cmd");
+            fs::write(&path, "@echo not-valid-base64!\r\n@exit /b 0\r\n").unwrap();
+            path
+        };
+        #[cfg(unix)]
+        let executor = {
+            let path = workspace.path().join("invalid-wire-cabal-runtime-hook");
+            fs::write(&path, "#!/bin/sh\nprintf %s 'not-valid-base64!'\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        };
+        let input = PreToolUseInput {
+            hook_event_name: "PreToolUse".to_owned(),
+            cwd: workspace.path().to_path_buf(),
+            tool_name: "Bash".to_owned(),
+            tool_input: serde_json::json!({
+                "command": "rg -n -C 8 -- InvalidWireNeedle ."
+            }),
+            session_id: Some("session-invalid-wire".to_owned()),
+        };
+        let output = prepare_pre_tool_use(input, &executor).unwrap().unwrap();
+        let wire = serde_json::to_value(output).unwrap();
+        let rewritten = wire["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap();
+        let expected = Command::new("rg")
+            .args(["-n", "-C", "8", "--", "InvalidWireNeedle", "."])
+            .current_dir(workspace.path())
+            .output()
+            .unwrap();
+        #[cfg(windows)]
+        let actual = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", rewritten])
+            .current_dir(workspace.path())
+            .output()
+            .unwrap();
+        #[cfg(unix)]
+        let actual = Command::new("/bin/sh")
+            .args(["-c", rewritten])
+            .current_dir(workspace.path())
+            .output()
+            .unwrap();
+
+        assert_eq!(actual.status.code(), expected.status.code());
+        assert_eq!(actual.stdout, expected.stdout);
+        assert_eq!(actual.stderr, expected.stderr);
+        assert!(!String::from_utf8_lossy(&actual.stdout).contains("not-valid-base64"));
     }
 
     #[test]
