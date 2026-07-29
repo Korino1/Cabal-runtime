@@ -1482,6 +1482,12 @@ mod tests {
     fn projection_is_lossless_grouped_and_strictly_smaller() {
         let (temp, gateway) = fixture_workspace();
         write_repeated_fixture(temp.path());
+        let fixture = temp.path().join("src/repeated.rs");
+        let crlf_source = fs::read_to_string(&fixture)
+            .unwrap()
+            .replace("\r\n", "\n")
+            .replace('\n', "\r\n");
+        fs::write(&fixture, crlf_source).unwrap();
         gateway.register_frame("session-1", Some("turn-1")).unwrap();
         let request = gateway
             .prepare_request("session-1", temp.path(), "rg -n -C 8 -- CausalNeedle .")
@@ -1506,26 +1512,36 @@ mod tests {
             .collect::<Vec<_>>();
         let mut actual = Vec::new();
         let mut current_path = None;
-        for line in text.lines().skip(1) {
-            if let Some(path) = line
-                .strip_suffix(':')
-                .filter(|line| !line.starts_with("  "))
-            {
-                current_path = Some(path.to_owned());
+        for line in text.as_bytes().split(|byte| *byte == b'\n').skip(1) {
+            if line.is_empty() {
                 continue;
             }
-            let record = line.strip_prefix("  ").expect("grouped record");
-            let delimiter = record.find([':', '-']).expect("line number delimiter");
-            let kind = if record.as_bytes()[delimiter] == b':' {
+            if !line.starts_with(b"  ") && line.ends_with(b":") {
+                current_path = Some(
+                    std::str::from_utf8(&line[..line.len() - 1])
+                        .unwrap()
+                        .to_owned(),
+                );
+                continue;
+            }
+            let record = line.strip_prefix(b"  ").expect("grouped record");
+            let delimiter = record
+                .iter()
+                .position(|byte| matches!(byte, b':' | b'-'))
+                .expect("line number delimiter");
+            let kind = if record[delimiter] == b':' {
                 RecordKind::Match
             } else {
                 RecordKind::Context
             };
             actual.push((
                 current_path.clone().expect("path header"),
-                record[..delimiter].parse::<u64>().unwrap(),
+                std::str::from_utf8(&record[..delimiter])
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap(),
                 kind,
-                record.as_bytes()[delimiter + 1..].to_vec(),
+                record[delimiter + 1..].to_vec(),
             ));
         }
         expected.sort_by_key(|(path, line, kind, bytes)| {
