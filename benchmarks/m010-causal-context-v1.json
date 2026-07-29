@@ -47,7 +47,7 @@
   "source_sha256": {
     "crates/cabal-causal-context/src/lib.rs": "6be25d05c31ba57a1ffd8af9dadb2ce5ee0cb88aa6988ead1833d35a7d1eec95",
     "crates/cabal-runtime-hook/src/lib.rs": "b416a1b77a0df540434fc3dbab49f76dd76d45ea3d4b68e71275a36e11d754c4",
-    "windows_release_binary": "570ad5b3f6c225193b51f0675099728897be6a53935f7e510952413b3c934488"
+    "windows_release_binary": "7697c3886d41e89bc89d0267e6e492c0ef4571c2a35d80ad92fe740f1ebcbac5"
   },
   "claim_boundary": "This aggregate applies only to the frozen fixture and tool versions above."
 }
