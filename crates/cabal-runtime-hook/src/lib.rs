@@ -1482,11 +1482,15 @@ fn status_from_success(success: bool) -> &'static str {
     if success { "completed" } else { "failed" }
 }
 
-/// Returns a bounded projection for every PostToolUse payload. The plugin
-/// matcher may choose a narrower surface, while a core-side caller can use the
-/// same fail-closed adapter for all built-in tool types.
+/// Returns a bounded projection only for supported shell output.
+///
+/// Results produced by MCP servers, apps, and other Codex plugins are owned by
+/// those providers and must pass through unchanged.
 pub fn project_post_tool_use(input: PostToolUseInput) -> Result<Option<HookOutput>, HookError> {
     if input.hook_event_name != "PostToolUse" {
+        return Ok(None);
+    }
+    if input.tool_name != "Bash" {
         return Ok(None);
     }
     if is_existing_projection(&input.tool_response) {
@@ -1498,14 +1502,6 @@ pub fn project_post_tool_use(input: PostToolUseInput) -> Result<Option<HookOutpu
     let raw = response_bytes(&input.tool_response)?;
     let semantic_raw = strip_codex_output_wrapper(&raw);
     let artifact_root = input.cwd.join(".cabal").join("artifacts");
-
-    if input.tool_name != "Bash" {
-        let _ = persist_unclassified_raw(&raw, &artifact_root);
-        return Ok(Some(HookOutput {
-            should_continue: false,
-            stop_reason: serde_json::to_string(&generic_projection("unknown"))?,
-        }));
-    }
 
     let command = input
         .tool_input
@@ -1941,22 +1937,22 @@ mod tests {
     }
 
     #[test]
-    fn non_bash_payloads_fail_closed_to_a_bounded_projection() {
+    fn memoryx_and_other_plugin_outputs_pass_through_untouched() {
         let workspace = tempfile::tempdir().unwrap();
         let input = PostToolUseInput {
             hook_event_name: "PostToolUse".to_owned(),
             cwd: workspace.path().to_path_buf(),
-            tool_name: "WebSearch".to_owned(),
-            tool_input: serde_json::json!({ "query": "ignored" }),
-            tool_response: Value::String("private-search-result".to_owned()),
+            tool_name: "mcp__memoryx__query".to_owned(),
+            tool_input: serde_json::json!({ "query": "project state" }),
+            tool_response: serde_json::json!({
+                "records": ["memoryx-result-must-remain-provider-owned"]
+            }),
         };
 
-        let output = project_post_tool_use(input).unwrap().unwrap();
+        let output = project_post_tool_use(input).unwrap();
 
-        assert!(!output.should_continue);
-        assert!(output.stop_reason.contains("\"operation\":\"command\""));
-        assert!(!output.stop_reason.contains("private-search-result"));
-        assert!(artifact_root_for(workspace.path()).exists());
+        assert!(output.is_none());
+        assert!(!artifact_root_for(workspace.path()).exists());
     }
 
     #[test]

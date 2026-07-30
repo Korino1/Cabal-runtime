@@ -27,6 +27,11 @@ This is transparent for the supported hook paths, not universal interception.
 Cabal does not claim control over unsupported tools, arbitrary shell syntax,
 all `unified_exec` paths, or MCP-side mutations.
 
+Outputs from MemoryX, Safeguard, other MCP servers, Codex apps, and third-party
+plugins remain owned by those providers. Cabal does not shorten, replace,
+suppress, or store their returned content. Context reduction applies only to
+the exact Cabal-owned command forms documented below.
+
 ## Implemented Modules
 
 ### Cargo Gateway
@@ -229,6 +234,11 @@ Cabal, не загружает специальные инструкции и н
 Прозрачность действует только для перечисленных обработчиков и точных форм
 команд. Проект не заявляет, что перехватывает любые команды оболочки, все
 варианты `unified_exec`, операции MCP или неизвестные инструменты.
+
+Ответы MemoryX, Safeguard, других серверов MCP, приложений Codex и сторонних
+плагинов остаются без изменений. Cabal не сокращает, не заменяет, не подавляет
+и не сохраняет их содержимое. Очистка контекста применяется только к явно
+перечисленным ниже командам, за обработку которых отвечает сам Cabal.
 
 ## Реализованные модули
 
