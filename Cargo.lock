@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "cabal-causal-context"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "cap-std",
  "fs2",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "cabal-runtime-hook"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "base64",
  "cabal-causal-context",
